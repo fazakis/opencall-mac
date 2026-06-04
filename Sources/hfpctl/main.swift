@@ -16,6 +16,17 @@ func iorString(_ result: IOReturn) -> String {
     String(format: "0x%08X", UInt32(bitPattern: result))
 }
 
+func machineValue(_ key: String, _ value: String) {
+    guard let data = value.data(using: .utf8) else { return }
+    print("OPENCALL_\(key)_B64=\(data.base64EncodedString())")
+    fflush(stdout)
+}
+
+func looksLikePhoneNumber(_ text: String) -> Bool {
+    let digits = text.filter { $0.isNumber }
+    return digits.count >= 5 && digits.count <= 18
+}
+
 final class Logger {
     let path: String
 
@@ -48,6 +59,7 @@ final class HFPCTL: NSObject {
     let number: String?
     var hf: IOBluetoothHandsFreeDevice?
     var callSetupMode = "unknown"
+    var lastIncomingNumber: String?
 
     init(command: String, address: String, logPath: String, number: String? = nil) {
         self.command = command
@@ -151,15 +163,48 @@ final class HFPCTL: NSObject {
         hf.dialNumber(cleanNumber)
     }
 
+    func rememberIncomingNumber(_ number: String) {
+        let clean = number.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, clean != lastIncomingNumber else { return }
+        lastIncomingNumber = clean
+        machineValue("INCOMING_NUMBER", clean)
+    }
+
+    static func extractPhoneNumber(from value: Any) -> String? {
+        if let string = value as? String, looksLikePhoneNumber(string) { return string }
+        if let number = value as? NSNumber {
+            let string = number.stringValue
+            if looksLikePhoneNumber(string) { return string }
+        }
+        if let dict = value as? NSDictionary {
+            let preferredKeys = ["number", "phoneNumber", "PhoneNumber", "kIOBluetoothHandsFreeCallNumber"]
+            for key in preferredKeys {
+                if let item = dict[key], let found = extractPhoneNumber(from: item) { return found }
+            }
+            for item in dict.allValues {
+                if let found = extractPhoneNumber(from: item) { return found }
+            }
+        }
+        if let array = value as? [Any] {
+            for item in array {
+                if let found = extractPhoneNumber(from: item) { return found }
+            }
+        }
+        return nil
+    }
+
     @objc func handsFree(_ device: IOBluetoothHandsFreeDevice, isServiceAvailable available: NSNumber) { logger.log("event isServiceAvailable=\(available)") }
     @objc func handsFree(_ device: IOBluetoothHandsFreeDevice, isCallActive active: NSNumber) { logger.log("event isCallActive=\(active)") }
     @objc func handsFree(_ device: IOBluetoothHandsFreeDevice, callSetupMode mode: NSNumber) { callSetupMode = mode.stringValue; logger.log("event callSetupMode=\(mode) (1=incoming)") }
     @objc func handsFree(_ device: IOBluetoothHandsFreeDevice, callHoldState state: NSNumber) { logger.log("event callHoldState=\(state)") }
     @objc func handsFree(_ device: IOBluetoothHandsFreeDevice, signalStrength strength: NSNumber) { logger.log("event signalStrength=\(strength)") }
     @objc func handsFree(_ device: IOBluetoothHandsFreeDevice, batteryCharge charge: NSNumber) { logger.log("event batteryCharge=\(charge)") }
-    @objc func handsFree(_ device: IOBluetoothHandsFreeDevice, incomingCallFrom number: String) { callSetupMode = "1"; logger.log("event incomingCallFrom=[number]") }
+    @objc func handsFree(_ device: IOBluetoothHandsFreeDevice, incomingCallFrom number: String) { callSetupMode = "1"; rememberIncomingNumber(number); logger.log("event incomingCallFrom=[number]") }
     @objc func handsFree(_ device: IOBluetoothHandsFreeDevice, ringAttempt attempt: NSNumber) { callSetupMode = "1"; logger.log("event ringAttempt=\(attempt)") }
-    @objc func handsFree(_ device: IOBluetoothHandsFreeDevice, currentCall call: NSDictionary) { logger.log("event currentCall=\(call.description)") }
+    @objc func handsFree(_ device: IOBluetoothHandsFreeDevice, currentCall call: NSDictionary) {
+        if let number = Self.extractPhoneNumber(from: call) { rememberIncomingNumber(number) }
+        logger.log("event currentCall=\(call.description)")
+    }
     @objc func handsFree(_ device: IOBluetoothHandsFreeDevice, subscriberNumber number: String) { logger.log("event subscriberNumber=[number]") }
     @objc func handsFree(_ device: IOBluetoothHandsFreeDevice, unhandledResultCode resultCode: String) { logger.log("event unhandledResultCode=\(resultCode)") }
 }

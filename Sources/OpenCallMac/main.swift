@@ -79,19 +79,19 @@ struct SendSmsResponse: Decodable {
     let error: String?
 }
 
-struct PhoneContact: Decodable, Identifiable, Hashable {
+struct PhoneContact: Codable, Identifiable, Hashable {
     let id: String
     let name: String
     let numbers: [ContactNumber]
 }
 
-struct ContactNumber: Decodable, Identifiable, Hashable {
+struct ContactNumber: Codable, Identifiable, Hashable {
     let label: String
     let number: String
     var id: String { "\(label)-\(number)" }
 }
 
-struct RecentCall: Decodable, Identifiable, Hashable {
+struct RecentCall: Codable, Identifiable, Hashable {
     let id: String
     let number: String
     let name: String?
@@ -100,7 +100,7 @@ struct RecentCall: Decodable, Identifiable, Hashable {
     let duration: Int64
 }
 
-struct SmsMessage: Decodable, Identifiable, Hashable {
+struct SmsMessage: Codable, Identifiable, Hashable {
     let id: String
     let address: String
     let body: String
@@ -174,6 +174,9 @@ enum LaunchAgentManager {
 @MainActor
 final class AppModel: NSObject, ObservableObject {
     static var shared: AppModel?
+    private static let contactsCacheKey = "cachedContacts"
+    private static let recentCallsCacheKey = "cachedRecentCalls"
+    private static let messagesCacheKey = "cachedSmsMessages"
 
     @Published var devices: [PhoneDevice] = []
     @Published var selectedAddress = UserDefaults.standard.string(forKey: "selectedAddress") ?? "" {
@@ -191,9 +194,9 @@ final class AppModel: NSObject, ObservableObject {
     @Published var companionURL = UserDefaults.standard.string(forKey: "companionURL") ?? "http://PHONE-IP:9096"
     @Published var companionToken = UserDefaults.standard.string(forKey: "companionToken") ?? ""
     @Published var syncStatus = "Install/open the Android companion, grant permissions, then paste its URL and token here."
-    @Published var contacts: [PhoneContact] = []
-    @Published var recentCalls: [RecentCall] = []
-    @Published var messages: [SmsMessage] = []
+    @Published var contacts: [PhoneContact] = AppModel.loadCachedArray(AppModel.contactsCacheKey, as: [PhoneContact].self)
+    @Published var recentCalls: [RecentCall] = AppModel.loadCachedArray(AppModel.recentCallsCacheKey, as: [RecentCall].self)
+    @Published var messages: [SmsMessage] = AppModel.loadCachedArray(AppModel.messagesCacheKey, as: [SmsMessage].self)
     @Published var launchAtLoginEnabled = LaunchAgentManager.isEnabled()
     @Published var monitoringEnabled = UserDefaults.standard.object(forKey: "monitoringEnabled") as? Bool ?? true {
         didSet {
@@ -242,6 +245,9 @@ final class AppModel: NSObject, ObservableObject {
         requestNotificationAccess()
         refreshDevices()
         refreshLog()
+        if !contacts.isEmpty || !recentCalls.isEmpty || !messages.isEmpty {
+            syncStatus = "Loaded cached sync: \(contacts.count) contacts, \(recentCalls.count) recents, \(messages.count) SMS."
+        }
         if monitoringEnabled { startMonitoring() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.autoConnectSelectedPhone() }
         if CommandLine.arguments.contains("--test-notification") {
@@ -298,7 +304,7 @@ final class AppModel: NSObject, ObservableObject {
             let result = Self.runHelper(path: helper, command: command, address: address, logPath: logPath, number: dialNumber)
             DispatchQueue.main.async {
                 self.busy = false
-                let trimmed = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let trimmed = Self.userVisibleHelperOutput(result.text).trimmingCharacters(in: .whitespacesAndNewlines)
                 self.output = trimmed.isEmpty ? "Done (exit \(result.exitCode))." : trimmed
                 self.refreshLog()
             }
@@ -322,6 +328,16 @@ final class AppModel: NSObject, ObservableObject {
     func saveCompanionSettings() {
         UserDefaults.standard.set(companionURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "companionURL")
         UserDefaults.standard.set(companionToken.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "companionToken")
+    }
+
+    private static func loadCachedArray<T: Decodable>(_ key: String, as type: [T].Type) -> [T] {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        return (try? JSONDecoder().decode(type, from: data)) ?? []
+    }
+
+    private func saveCachedArray<T: Encodable>(_ value: [T], key: String) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        UserDefaults.standard.set(data, forKey: key)
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
@@ -406,6 +422,8 @@ final class AppModel: NSObject, ObservableObject {
                 let text = result.text
                 let incoming = text.contains("callSetupMode=1") || text.contains("ringAttempt=") || text.contains("incomingCallFrom=")
                 let active = text.contains("isCallActive=1")
+                let callerNumber = Self.machineValue(named: "INCOMING_NUMBER", in: text)
+                let callerLabel = self.contactLabel(forPhoneNumber: callerNumber)
                 let now = Date()
                 let shouldNotifyIncoming = incoming && (!self.incomingCallNotified || now.timeIntervalSince(self.lastIncomingNotificationAt) > 20)
                 let shouldNotifyActive = active && (!self.activeCallNotified || now.timeIntervalSince(self.lastActiveCallNotificationAt) > 60)
@@ -413,11 +431,13 @@ final class AppModel: NSObject, ObservableObject {
                     self.incomingCallNotified = true
                     self.lastIncomingNotificationAt = now
                     self.appendAppLog("Incoming call detected; requesting notification")
-                    self.postNotification(title: "Incoming call", subtitle: self.selectedDeviceName, body: "OpenCall detected an incoming mobile call.", identifier: "opencall.incoming-call.\(Int(now.timeIntervalSince1970))", kind: .incomingCall)
-                    self.monitorStatus = "Incoming call detected."
+                    let subtitle = callerLabel ?? self.selectedDeviceName
+                    let body = callerLabel == nil ? "OpenCall detected an incoming mobile call." : "Ringing on \(self.selectedDeviceName)."
+                    self.postNotification(title: "Incoming call", subtitle: subtitle, body: body, identifier: "opencall.incoming-call.\(Int(now.timeIntervalSince1970))", kind: .incomingCall)
+                    self.monitorStatus = callerLabel == nil ? "Incoming call detected." : "Incoming call from \(subtitle)."
                 } else if incoming {
                     self.appendAppLog("Incoming call still ringing; notification already sent/recently suppressed")
-                    self.monitorStatus = "Incoming call detected."
+                    self.monitorStatus = callerLabel == nil ? "Incoming call detected." : "Incoming call from \(callerLabel!)."
                 } else if shouldNotifyActive {
                     self.incomingCallNotified = false
                     self.activeCallNotified = true
@@ -449,6 +469,7 @@ final class AppModel: NSObject, ObservableObject {
             case .success(let response) where response.ok:
                 let fetched = response.messages ?? []
                 self.messages = fetched
+                self.saveCachedArray(fetched, key: Self.messagesCacheKey)
                 let newest = fetched.map(\.date).max() ?? self.lastSeenMessageDate
                 if !self.messageBaselinePrimed {
                     self.messageBaselinePrimed = true
@@ -460,7 +481,8 @@ final class AppModel: NSObject, ObservableObject {
                     .filter { $0.type == "inbox" && $0.date > self.lastSeenMessageDate }
                     .sorted { $0.date < $1.date }
                 for message in newIncoming.prefix(3) {
-                    self.postNotification(title: "New mobile message", subtitle: message.address, body: self.notificationSnippet(message.body), identifier: "opencall.sms.\(message.id)", kind: .sms, sms: message)
+                    let sender = self.contactLabel(forPhoneNumber: message.address) ?? "Unknown sender"
+                    self.postNotification(title: "New mobile message", subtitle: sender, body: self.notificationSnippet(message.body), identifier: "opencall.sms.\(message.id)", kind: .sms, sms: message)
                 }
                 if newIncoming.count > 3 {
                     self.postNotification(title: "New mobile messages", subtitle: self.selectedDeviceName, body: "\(newIncoming.count) new SMS messages received.", identifier: "opencall.sms.summary.\(newest)", kind: .smsSummary)
@@ -481,6 +503,43 @@ final class AppModel: NSObject, ObservableObject {
         let clean = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         if clean.count <= 120 { return clean }
         return String(clean.prefix(117)) + "…"
+    }
+
+    func contactLabel(forPhoneNumber number: String?) -> String? {
+        guard let number else { return nil }
+        let clean = number.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return nil }
+        if let name = contactName(forPhoneNumber: clean) { return name }
+        if let recentName = recentCalls.first(where: { Self.phoneNumbersMatch(clean, $0.number) && ($0.name?.isEmpty == false) })?.name {
+            return recentName
+        }
+        return clean
+    }
+
+    private func contactName(forPhoneNumber number: String) -> String? {
+        for contact in contacts {
+            guard !contact.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            if contact.numbers.contains(where: { Self.phoneNumbersMatch(number, $0.number) }) {
+                return contact.name
+            }
+        }
+        return nil
+    }
+
+    nonisolated static func normalizedPhoneNumber(_ number: String) -> String {
+        var digits = number.filter { $0.isNumber }
+        while digits.hasPrefix("00") { digits.removeFirst(2) }
+        return digits
+    }
+
+    nonisolated static func phoneNumbersMatch(_ lhs: String, _ rhs: String) -> Bool {
+        let left = normalizedPhoneNumber(lhs)
+        let right = normalizedPhoneNumber(rhs)
+        guard !left.isEmpty, !right.isEmpty else { return false }
+        if left == right { return true }
+        let shortest = min(left.count, right.count)
+        guard shortest >= 7 else { return false }
+        return left.hasSuffix(right) || right.hasSuffix(left)
     }
 
     func sendTestNotification() {
@@ -673,7 +732,9 @@ final class AppModel: NSObject, ObservableObject {
             panel.close()
             self.messagePanels.removeAll { $0 === panel }
         }
+        let senderDisplay = contactLabel(forPhoneNumber: message.address) ?? (message.address.isEmpty ? "Unknown sender" : message.address)
         panel.contentView = NSHostingView(rootView: SmsMessageDetailView(message: message,
+                                                                         senderDisplayName: senderDisplay,
                                                                          onCall: { [weak self] in self?.call(message.address) },
                                                                          onReply: { [weak self] text, done in
                                                                              self?.sendSmsReply(to: message.address, text: text, completion: done)
@@ -874,6 +935,7 @@ final class AppModel: NSObject, ObservableObject {
             switch result {
             case .success(let response) where response.ok:
                 self.contacts = response.contacts ?? []
+                self.saveCachedArray(self.contacts, key: Self.contactsCacheKey)
                 self.syncStatus = "Loaded \(self.contacts.count) contacts."
             case .success(let response):
                 self.syncStatus = "Contacts failed: \(response.error ?? "unknown error")"
@@ -890,6 +952,7 @@ final class AppModel: NSObject, ObservableObject {
             switch result {
             case .success(let response) where response.ok:
                 self.recentCalls = response.calls ?? []
+                self.saveCachedArray(self.recentCalls, key: Self.recentCallsCacheKey)
                 self.syncStatus = "Loaded \(self.recentCalls.count) recent calls."
             case .success(let response):
                 self.syncStatus = "Recent calls failed: \(response.error ?? "unknown error")"
@@ -906,6 +969,7 @@ final class AppModel: NSObject, ObservableObject {
             switch result {
             case .success(let response) where response.ok:
                 self.messages = response.messages ?? []
+                self.saveCachedArray(self.messages, key: Self.messagesCacheKey)
                 self.syncStatus = "Loaded \(self.messages.count) SMS messages."
             case .success(let response):
                 self.syncStatus = "Messages failed: \(response.error ?? "unknown error")"
@@ -1058,6 +1122,24 @@ final class AppModel: NSObject, ObservableObject {
         }
     }
 
+    nonisolated static func machineValue(named key: String, in text: String) -> String? {
+        let prefix = "OPENCALL_\(key)_B64="
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix(prefix) else { continue }
+            let encoded = String(line.dropFirst(prefix.count))
+            guard let data = Data(base64Encoded: encoded), let value = String(data: data, encoding: .utf8) else { continue }
+            return value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return nil
+    }
+
+    nonisolated static func userVisibleHelperOutput(_ text: String) -> String {
+        text.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("OPENCALL_") }
+            .joined(separator: "\n")
+    }
+
     nonisolated static func runHelper(path: String, command: String, address: String, logPath: String, number: String? = nil) -> CommandResult {
         let task = Process()
         let stdout = Pipe()
@@ -1156,6 +1238,7 @@ struct NotificationBannerView: View {
 
 struct SmsMessageDetailView: View {
     let message: SmsMessage
+    let senderDisplayName: String
     let onCall: () -> Void
     let onReply: (_ text: String, _ done: @escaping (String) -> Void) -> Void
     let onClose: () -> Void
@@ -1170,7 +1253,7 @@ struct SmsMessageDetailView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("SMS Message")
                         .font(.title3.weight(.semibold))
-                    Text(message.address.isEmpty ? "Unknown sender" : message.address)
+                    Text(senderDisplayName)
                         .font(.headline)
                     Text(formattedDate)
                         .font(.caption)
@@ -1526,9 +1609,10 @@ struct ContentView: View {
 
     private var recentsView: some View {
         List(model.recentCalls) { call in
+            let displayName = call.name?.isEmpty == false ? call.name! : (model.contactLabel(forPhoneNumber: call.number) ?? call.number)
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text((call.name?.isEmpty == false ? call.name! : call.number)).font(.headline)
+                    Text(displayName).font(.headline)
                     Text("\(call.type) • \(formatMillis(call.date)) • \(call.duration)s")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -1543,9 +1627,10 @@ struct ContentView: View {
 
     private var messagesView: some View {
         List(model.messages) { message in
+            let sender = model.contactLabel(forPhoneNumber: message.address) ?? message.address
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text(message.address).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    Text(sender).font(.caption.weight(.semibold)).textSelection(.enabled)
                     Text(message.type).font(.caption).foregroundStyle(.secondary)
                     Spacer()
                     Text(formatMillis(message.date)).font(.caption).foregroundStyle(.secondary)

@@ -6,3 +6,5 @@ android-companion/build/
 apk/*.apk
 apk/*.idsig
 apk/*.keystore
+
+dist/
