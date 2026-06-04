@@ -40,6 +40,19 @@ struct HealthResponse: Decodable {
     let error: String?
 }
 
+struct CallStateResponse: Decodable {
+    let ok: Bool
+    let state: String?
+    let stateCode: Int?
+    let idle: Bool?
+    let ringing: Bool?
+    let offhook: Bool?
+    let incomingNumber: String?
+    let updatedAt: Int64?
+    let listening: Bool?
+    let error: String?
+}
+
 struct CompanionMetadata: Decodable {
     let ok: Bool?
     let service: String?
@@ -177,6 +190,8 @@ final class AppModel: NSObject, ObservableObject {
     private static let contactsCacheKey = "cachedContacts"
     private static let recentCallsCacheKey = "cachedRecentCalls"
     private static let messagesCacheKey = "cachedSmsMessages"
+    private static let activeCallPollPausedUntilKey = "activeCallPollPausedUntil"
+    private static let activeCallPollPauseSeconds: TimeInterval = 90 * 60
 
     @Published var devices: [PhoneDevice] = []
     @Published var selectedAddress = UserDefaults.standard.string(forKey: "selectedAddress") ?? "" {
@@ -208,11 +223,14 @@ final class AppModel: NSObject, ObservableObject {
 
     private var monitorTimer: Timer?
     private var isPollingCall = false
+    private var isPollingCompanionCallState = false
     private var isPollingMessages = false
     private var incomingCallNotified = false
     private var activeCallNotified = false
     private var lastIncomingNotificationAt = Date.distantPast
     private var lastActiveCallNotificationAt = Date.distantPast
+    private var activeCallPollPausedUntil = Date(timeIntervalSince1970: UserDefaults.standard.double(forKey: AppModel.activeCallPollPausedUntilKey))
+    private var activeCallPollMinimumResumeAt = Date.distantPast
     private var lastSeenMessageDate = UserDefaults.standard.object(forKey: "lastSeenMessageDate") as? Int64 ?? 0
     private var messageBaselinePrimed = UserDefaults.standard.object(forKey: "lastSeenMessageDate") != nil
     private var lastMessagePoll = Date.distantPast
@@ -294,6 +312,11 @@ final class AppModel: NSObject, ObservableObject {
         if command == "dial", (dialNumber ?? "").isEmpty {
             output = "Enter a phone number before pressing Dial."
             return
+        }
+        if command == "answer" || command == "dial" {
+            pauseAutomaticCallPollingForActiveCall(note: command == "answer" ? "after answering" : "after dialing")
+        } else if command == "hangup" {
+            resumeAutomaticCallPollingAfterCallEnded()
         }
         let helper = helperPath
         let address = selectedAddress
@@ -391,17 +414,152 @@ final class AppModel: NSObject, ObservableObject {
             monitorStatus = "No remembered phone available."
             return
         }
+        if companionCallStateAvailable {
+            monitorStatus = "Using Android companion for call state; automatic HFP probe skipped."
+            pollCompanionCallStateForMonitor()
+            return
+        }
+        guard !isAutomaticCallPollingPaused else {
+            monitorStatus = "Call audio protected: automatic HFP polling is paused."
+            return
+        }
         pollCallState(reason: "Auto-connecting to \(selectedDeviceName)…")
+    }
+
+    private var isAutomaticCallPollingPaused: Bool {
+        if activeCallPollPausedUntil > Date() { return true }
+        if UserDefaults.standard.object(forKey: Self.activeCallPollPausedUntilKey) != nil {
+            UserDefaults.standard.removeObject(forKey: Self.activeCallPollPausedUntilKey)
+        }
+        return false
+    }
+
+    private func pauseAutomaticCallPollingForActiveCall(note: String) {
+        let wasPaused = activeCallPollPausedUntil > Date()
+        let until = Date().addingTimeInterval(Self.activeCallPollPauseSeconds)
+        if until > activeCallPollPausedUntil {
+            activeCallPollPausedUntil = until
+            UserDefaults.standard.set(until.timeIntervalSince1970, forKey: Self.activeCallPollPausedUntilKey)
+        }
+        if !wasPaused {
+            activeCallPollMinimumResumeAt = Date().addingTimeInterval(45)
+        }
+        monitorStatus = "Call audio protected: automatic HFP polling off; companion watches call state."
+        appendAppLog("Automatic HFP polling paused \(note) until \(Self.shortTime(activeCallPollPausedUntil)) to avoid stealing Bluetooth/AirPods audio")
+    }
+
+    func resumeAutomaticCallPollingNow() {
+        resumeAutomaticCallPollingAfterCallEnded(logReason: "manual resume")
+    }
+
+    private func resumeAutomaticCallPollingAfterCallEnded(logReason: String = "hangup") {
+        activeCallPollPausedUntil = Date.distantPast
+        activeCallPollMinimumResumeAt = Date.distantPast
+        UserDefaults.standard.removeObject(forKey: Self.activeCallPollPausedUntilKey)
+        activeCallNotified = false
+        incomingCallNotified = false
+        monitorStatus = "Call monitor resumed."
+        appendAppLog("Automatic HFP polling resumed after \(logReason)")
+    }
+
+    nonisolated private static func shortTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
+        return formatter.string(from: date)
     }
 
     private func pollResidentStatus() {
         guard monitoringEnabled else { return }
         refreshDevices()
-        if !selectedAddress.isEmpty { pollCallState(reason: nil) }
+        if !selectedAddress.isEmpty {
+            if companionCallStateAvailable {
+                pollCompanionCallStateForMonitor()
+            } else if isAutomaticCallPollingPaused {
+                monitorStatus = "Call audio protected: automatic HFP polling is paused."
+            } else {
+                pollCallState(reason: nil)
+            }
+        }
         if Date().timeIntervalSince(lastMessagePoll) >= 18 {
             lastMessagePoll = Date()
             pollMessagesForNotifications()
         }
+    }
+
+    private var companionCallStateAvailable: Bool {
+        let base = companionURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = companionToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !base.isEmpty && !base.contains("PHONE-IP") && base.contains("://") && !token.isEmpty
+    }
+
+    private func pollCompanionCallStateForMonitor() {
+        guard !isPollingCompanionCallState else { return }
+        isPollingCompanionCallState = true
+        fetch("call-state", as: CallStateResponse.self) { result in
+            self.isPollingCompanionCallState = false
+            switch result {
+            case .success(let response) where response.ok:
+                self.handleCompanionCallState(response)
+            case .success(let response):
+                self.handleCompanionCallStateFailure(response.error ?? "unknown error")
+            case .failure(let error):
+                self.handleCompanionCallStateFailure(error.message)
+            }
+        }
+    }
+
+    private func handleCompanionCallState(_ response: CallStateResponse) {
+        let state = (response.state ?? "unknown").lowercased()
+        let now = Date()
+        if response.offhook == true || state == "offhook" || state == "active" {
+            incomingCallNotified = false
+            activeCallNotified = true
+            lastActiveCallNotificationAt = now
+            pauseAutomaticCallPollingForActiveCall(note: "while companion reports offhook")
+            return
+        }
+        if response.ringing == true || state == "ringing" {
+            pauseAutomaticCallPollingForActiveCall(note: "while companion reports ringing")
+            let rawNumber = response.incomingNumber?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let callerLabel = contactLabel(forPhoneNumber: rawNumber)
+            let shouldNotifyIncoming = !incomingCallNotified || now.timeIntervalSince(lastIncomingNotificationAt) > 20
+            if shouldNotifyIncoming {
+                incomingCallNotified = true
+                lastIncomingNotificationAt = now
+                let subtitle = callerLabel ?? selectedDeviceName
+                let body = callerLabel == nil ? "OpenCall detected an incoming mobile call." : "Ringing on \(selectedDeviceName)."
+                appendAppLog("Incoming call detected by Android companion; requesting notification")
+                postNotification(title: "Incoming call", subtitle: subtitle, body: body, identifier: "opencall.incoming-call.\(Int(now.timeIntervalSince1970))", kind: .incomingCall)
+            }
+            monitorStatus = callerLabel == nil ? "Incoming call detected by companion." : "Incoming call from \(callerLabel!)."
+            return
+        }
+        if response.idle == true || state == "idle" {
+            incomingCallNotified = false
+            activeCallNotified = false
+            if isAutomaticCallPollingPaused {
+                if Date() >= activeCallPollMinimumResumeAt {
+                    resumeAutomaticCallPollingAfterCallEnded(logReason: "companion call-state idle")
+                    monitorStatus = "Phone idle by companion; HFP auto-polling resumed."
+                } else {
+                    monitorStatus = "Phone idle; waiting briefly before HFP auto-poll resumes."
+                }
+            } else {
+                monitorStatus = "Phone idle by companion; HFP auto-polling skipped."
+            }
+            return
+        }
+        handleCompanionCallStateFailure("unknown call state: \(state)")
+    }
+
+    private func handleCompanionCallStateFailure(_ message: String) {
+        if isAutomaticCallPollingPaused {
+            monitorStatus = "Call audio protected; companion call-state unavailable: \(message)"
+            return
+        }
+        appendAppLog("Companion call-state unavailable; falling back to HFP monitor: \(message)")
+        pollCallState(reason: nil)
     }
 
     private func pollCallState(reason: String?) {
@@ -442,12 +600,11 @@ final class AppModel: NSObject, ObservableObject {
                     self.incomingCallNotified = false
                     self.activeCallNotified = true
                     self.lastActiveCallNotificationAt = now
-                    self.appendAppLog("Active call detected; requesting notification")
-                    self.postNotification(title: "Call active", subtitle: self.selectedDeviceName, body: "OpenCall detected an active mobile call.", identifier: "opencall.active-call.\(Int(now.timeIntervalSince1970))", kind: .activeCall)
-                    self.monitorStatus = "Call active on \(self.selectedDeviceName)."
+                    self.appendAppLog("Active call detected; pausing automatic HFP polling to avoid changing Bluetooth audio route")
+                    self.pauseAutomaticCallPollingForActiveCall(note: "after active-call detection")
                 } else if active {
                     self.incomingCallNotified = false
-                    self.monitorStatus = "Call active on \(self.selectedDeviceName)."
+                    self.pauseAutomaticCallPollingForActiveCall(note: "while call is active")
                 } else {
                     self.incomingCallNotified = false
                     self.activeCallNotified = false
@@ -1445,6 +1602,7 @@ struct MenuBarView: View {
         Text(model.monitorStatus)
         Divider()
         Button("Check HFP") { model.autoConnectSelectedPhone() }
+        Button("Resume HFP Monitor") { model.resumeAutomaticCallPollingNow() }
         Button("Sync All") { model.syncAll() }
         Button("Auto via Bluetooth") { model.discoverCompanionByBluetooth() }
         Button("Test Notification") { model.sendTestNotification() }
@@ -1546,6 +1704,7 @@ struct ContentView: View {
                 Toggle("Monitor calls/messages", isOn: Binding(get: { model.monitoringEnabled }, set: { model.setMonitoringEnabled($0) }))
                 Button("Auto-connect now") { model.autoConnectSelectedPhone() }
                     .disabled(model.selectedAddress.isEmpty)
+                Button("Resume HFP monitor") { model.resumeAutomaticCallPollingNow() }
                 Button("Test notification") { model.sendTestNotification() }
                 Spacer()
                 Text(model.monitorStatus)

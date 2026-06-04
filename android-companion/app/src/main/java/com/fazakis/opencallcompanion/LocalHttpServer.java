@@ -113,6 +113,7 @@ final class LocalHttpServer {
             int limit = parseLimit(params.get("limit"));
             try {
                 if ("/contacts".equals(path)) respond(out, 200, provider.contacts());
+                else if ("/call-state".equals(path) || "/callstate".equals(path)) respond(out, 200, provider.callState());
                 else if ("/calls".equals(path) || "/recents".equals(path)) respond(out, 200, provider.calls(limit));
                 else if ("/sms".equals(path) || "/messages".equals(path)) respond(out, 200, provider.sms(limit));
                 else if ("/send-sms".equals(path) || "/sms/send".equals(path)) {

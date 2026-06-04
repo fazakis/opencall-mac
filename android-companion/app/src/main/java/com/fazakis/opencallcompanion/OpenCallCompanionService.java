@@ -19,6 +19,7 @@ public class OpenCallCompanionService extends Service {
     private static LocalHttpServer server;
     private static BluetoothMetaServer bluetoothMetaServer;
     private static BleMetaServer bleMetaServer;
+    private static CallStateTracker callStateTracker;
 
     static LocalHttpServer server(android.content.Context context) {
         if (server == null) server = new LocalHttpServer(context.getApplicationContext());
@@ -35,12 +36,18 @@ public class OpenCallCompanionService extends Service {
         return bleMetaServer;
     }
 
+    static CallStateTracker callStateTracker(android.content.Context context) {
+        if (callStateTracker == null) callStateTracker = new CallStateTracker(context.getApplicationContext());
+        return callStateTracker;
+    }
+
     @Override public void onCreate() {
         super.onCreate();
         startForeground(42, notification());
         server(this).start();
         bluetoothMetaServer(this).start();
         bleMetaServer(this).start();
+        callStateTracker(this).start();
         refreshNotification();
     }
 
@@ -48,6 +55,7 @@ public class OpenCallCompanionService extends Service {
         server(this).start();
         bluetoothMetaServer(this).start();
         bleMetaServer(this).start();
+        callStateTracker(this).start();
         refreshNotification();
         return START_STICKY;
     }
@@ -61,6 +69,7 @@ public class OpenCallCompanionService extends Service {
     }
 
     @Override public void onDestroy() {
+        callStateTracker(this).stop();
         bleMetaServer(this).stop();
         bluetoothMetaServer(this).stop();
         server(this).stop();

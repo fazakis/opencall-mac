@@ -166,10 +166,15 @@ final class DataProvider {
         return out;
     }
 
+    JSONObject callState() throws Exception {
+        require(Manifest.permission.READ_PHONE_STATE);
+        return OpenCallCompanionService.callStateTracker(context).snapshot();
+    }
+
     JSONObject health(String token, boolean running, int port, boolean bluetoothRunning, boolean bleRunning, String bleError) throws Exception {
         JSONObject out = ok();
         out.put("service", "OpenCall Companion");
-        out.put("version", 3);
+        out.put("version", 4);
         out.put("running", running);
         out.put("port", port);
         out.put("bluetoothRunning", bluetoothRunning || bleRunning);
@@ -184,6 +189,7 @@ final class DataProvider {
         if (!hasPermission(Manifest.permission.READ_SMS)) missing.put("READ_SMS");
         if (!hasPermission(Manifest.permission.SEND_SMS)) missing.put("SEND_SMS");
         if (!hasPermission(Manifest.permission.READ_CALL_LOG)) missing.put("READ_CALL_LOG");
+        if (!hasPermission(Manifest.permission.READ_PHONE_STATE)) missing.put("READ_PHONE_STATE");
         if (android.os.Build.VERSION.SDK_INT >= 31 && !hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) missing.put("BLUETOOTH_CONNECT");
         if (android.os.Build.VERSION.SDK_INT >= 31 && !hasPermission(Manifest.permission.BLUETOOTH_ADVERTISE)) missing.put("BLUETOOTH_ADVERTISE");
         out.put("missingPermissions", missing);

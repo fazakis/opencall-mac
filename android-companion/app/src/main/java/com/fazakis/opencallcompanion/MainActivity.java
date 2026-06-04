@@ -123,6 +123,7 @@ public class MainActivity extends Activity {
         addIfMissing(needed, Manifest.permission.READ_SMS);
         addIfMissing(needed, Manifest.permission.SEND_SMS);
         addIfMissing(needed, Manifest.permission.READ_CALL_LOG);
+        addIfMissing(needed, Manifest.permission.READ_PHONE_STATE);
         if (Build.VERSION.SDK_INT >= 31) {
             addIfMissing(needed, Manifest.permission.BLUETOOTH_CONNECT);
             addIfMissing(needed, Manifest.permission.BLUETOOTH_ADVERTISE);
@@ -147,6 +148,7 @@ public class MainActivity extends Activity {
         appendPerm(sb, "SMS read", Manifest.permission.READ_SMS);
         appendPerm(sb, "SMS send", Manifest.permission.SEND_SMS);
         appendPerm(sb, "Call log", Manifest.permission.READ_CALL_LOG);
+        appendPerm(sb, "Phone state", Manifest.permission.READ_PHONE_STATE);
         if (Build.VERSION.SDK_INT >= 31) {
             appendPerm(sb, "Bluetooth connect", Manifest.permission.BLUETOOTH_CONNECT);
             appendPerm(sb, "Bluetooth advertise", Manifest.permission.BLUETOOTH_ADVERTISE);
