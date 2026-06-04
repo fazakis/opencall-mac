@@ -95,6 +95,35 @@ Resident features:
 
 Message notifications require the Android companion HTTP server to be reachable and a saved companion URL/token. Incoming-call notifications use the selected paired Bluetooth phone and the bundled `hfpctl` helper.
 
+### Enable macOS notifications
+
+OpenCall Mac asks for notification permission the first time it tries to show a notification. To enable or fix notifications:
+
+1. Run OpenCall Mac:
+
+   ```bash
+   ./scripts/run.sh
+   ```
+
+2. Open the menu-bar window and click **Test notification**.
+3. If macOS shows a permission prompt, choose **Allow**.
+4. If notifications were denied or no prompt appears, open:
+
+   ```text
+   System Settings → Notifications → OpenCall Mac
+   ```
+
+   Then enable **Allow Notifications**. For best results, also enable **Banners**, **Sounds**, and **Show in Notification Center**.
+5. Make sure Focus / Do Not Disturb is not suppressing banners.
+
+You can also trigger the first permission request from Terminal:
+
+```bash
+open "build/OpenCall Mac.app" --args --test-notification
+```
+
+Because OpenCall Mac is an unsigned menu-bar utility (`LSUIElement`), macOS may occasionally suppress standard Notification Center banners. The app also shows its own floating notification panel as a fallback for incoming calls and SMS events.
+
 ## License
 
 MIT License. See [LICENSE](LICENSE).
