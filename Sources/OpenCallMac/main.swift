@@ -1,0 +1,1089 @@
+import SwiftUI
+import AppKit
+import IOBluetooth
+import Foundation
+import UserNotifications
+
+struct PhoneDevice: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let address: String
+    var displayName: String { name.isEmpty ? address : "\(name) — \(address)" }
+}
+
+struct CommandResult {
+    let text: String
+    let exitCode: Int32
+}
+
+struct ProcessOutput {
+    let stdout: String
+    let stderr: String
+    let exitCode: Int32
+}
+
+struct SyncError: Error, CustomStringConvertible, LocalizedError {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var description: String { message }
+    var errorDescription: String? { message }
+}
+
+struct HealthResponse: Decodable {
+    let ok: Bool
+    let service: String?
+    let running: Bool?
+    let port: Int?
+    let bluetoothRunning: Bool?
+    let bluetoothUuid: String?
+    let missingPermissions: [String]?
+    let error: String?
+}
+
+struct CompanionMetadata: Decodable {
+    let ok: Bool?
+    let service: String?
+    let version: Int?
+    let url: String?
+    let port: Int?
+    let token: String?
+    let bluetoothUuid: String?
+}
+
+struct ContactsResponse: Decodable {
+    let ok: Bool
+    let contacts: [PhoneContact]?
+    let count: Int?
+    let error: String?
+}
+
+struct CallsResponse: Decodable {
+    let ok: Bool
+    let calls: [RecentCall]?
+    let count: Int?
+    let error: String?
+}
+
+struct SmsResponse: Decodable {
+    let ok: Bool
+    let messages: [SmsMessage]?
+    let count: Int?
+    let error: String?
+}
+
+struct PhoneContact: Decodable, Identifiable, Hashable {
+    let id: String
+    let name: String
+    let numbers: [ContactNumber]
+}
+
+struct ContactNumber: Decodable, Identifiable, Hashable {
+    let label: String
+    let number: String
+    var id: String { "\(label)-\(number)" }
+}
+
+struct RecentCall: Decodable, Identifiable, Hashable {
+    let id: String
+    let number: String
+    let name: String?
+    let type: String
+    let date: Int64
+    let duration: Int64
+}
+
+struct SmsMessage: Decodable, Identifiable, Hashable {
+    let id: String
+    let address: String
+    let body: String
+    let date: Int64
+    let type: String
+    let read: Bool
+}
+
+
+enum LaunchAgentManager {
+    static let label = "local.opencall.mac"
+
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+
+    static func isEnabled() -> Bool {
+        FileManager.default.fileExists(atPath: plistURL.path)
+    }
+
+    static func setEnabled(_ enabled: Bool) throws {
+        let fm = FileManager.default
+        let dir = plistURL.deletingLastPathComponent()
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+
+        if enabled {
+            let appPath = Bundle.main.bundlePath
+            let plist = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>Label</key><string>\(label)</string>
+              <key>ProgramArguments</key>
+              <array>
+                <string>/usr/bin/open</string>
+                <string>-g</string>
+                <string>\(appPath)</string>
+              </array>
+              <key>RunAtLoad</key><true/>
+              <key>LimitLoadToSessionType</key><string>Aqua</string>
+            </dict>
+            </plist>
+            """
+            try plist.write(to: plistURL, atomically: true, encoding: .utf8)
+        } else if fm.fileExists(atPath: plistURL.path) {
+            try fm.removeItem(at: plistURL)
+        }
+    }
+}
+
+@MainActor
+final class AppModel: NSObject, ObservableObject {
+    @Published var devices: [PhoneDevice] = []
+    @Published var selectedAddress = UserDefaults.standard.string(forKey: "selectedAddress") ?? "" {
+        didSet {
+            if !selectedAddress.isEmpty {
+                UserDefaults.standard.set(selectedAddress, forKey: "selectedAddress")
+            }
+        }
+    }
+    @Published var output = "Ready. Buttons run the bundled hfpctl helper using native macOS HFP APIs."
+    @Published var busy = false
+    @Published var logText = ""
+    @Published var dialNumber = ""
+
+    @Published var companionURL = UserDefaults.standard.string(forKey: "companionURL") ?? "http://PHONE-IP:9096"
+    @Published var companionToken = UserDefaults.standard.string(forKey: "companionToken") ?? ""
+    @Published var syncStatus = "Install/open the Android companion, grant permissions, then paste its URL and token here."
+    @Published var contacts: [PhoneContact] = []
+    @Published var recentCalls: [RecentCall] = []
+    @Published var messages: [SmsMessage] = []
+    @Published var launchAtLoginEnabled = LaunchAgentManager.isEnabled()
+    @Published var monitoringEnabled = UserDefaults.standard.object(forKey: "monitoringEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(monitoringEnabled, forKey: "monitoringEnabled")
+            monitoringEnabled ? startMonitoring() : stopMonitoring()
+        }
+    }
+    @Published var monitorStatus = "Resident monitor ready."
+
+    private var monitorTimer: Timer?
+    private var isPollingCall = false
+    private var isPollingMessages = false
+    private var incomingCallNotified = false
+    private var lastSeenMessageDate = UserDefaults.standard.object(forKey: "lastSeenMessageDate") as? Int64 ?? 0
+    private var messageBaselinePrimed = UserDefaults.standard.object(forKey: "lastSeenMessageDate") != nil
+    private var lastMessagePoll = Date.distantPast
+    private var notificationPanels: [NSPanel] = []
+
+    let logPath = NSString(string: "~/opencall-mac/logs/hfp.log").expandingTildeInPath
+
+    var helperPath: String {
+        if let executableDir = Bundle.main.executableURL?.deletingLastPathComponent().path {
+            return URL(fileURLWithPath: executableDir).appendingPathComponent("hfpctl").path
+        }
+        return NSString(string: "~/opencall-mac/build/OpenCall Mac.app/Contents/MacOS/hfpctl").expandingTildeInPath
+    }
+
+    var btHelperPath: String {
+        if let executableDir = Bundle.main.executableURL?.deletingLastPathComponent().path {
+            return URL(fileURLWithPath: executableDir).appendingPathComponent("btmeta").path
+        }
+        return NSString(string: "~/opencall-mac/build/OpenCall Mac.app/Contents/MacOS/btmeta").expandingTildeInPath
+    }
+
+    var selectedDeviceName: String {
+        devices.first(where: { $0.address.lowercased() == selectedAddress.lowercased() })?.displayName ?? selectedAddress
+    }
+
+    override init() {
+        super.init()
+        requestNotificationAccess()
+        refreshDevices()
+        refreshLog()
+        if monitoringEnabled { startMonitoring() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.autoConnectSelectedPhone() }
+        if CommandLine.arguments.contains("--test-notification") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.sendTestNotification() }
+        }
+    }
+
+    func refreshDevices() {
+        let paired = (IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice]) ?? []
+        devices = paired.map { device in
+            PhoneDevice(id: device.addressString ?? UUID().uuidString,
+                        name: device.name ?? "",
+                        address: device.addressString ?? "")
+        }
+        .filter { !$0.address.isEmpty }
+        .sorted { lhs, rhs in
+            let l = lhs.displayName.lowercased()
+            let r = rhs.displayName.lowercased()
+            let lhsLooksPhone = l.contains("xiaomi") || l.contains("mix") || l.contains("phone")
+            let rhsLooksPhone = r.contains("xiaomi") || r.contains("mix") || r.contains("phone")
+            if lhsLooksPhone != rhsLooksPhone { return lhsLooksPhone && !rhsLooksPhone }
+            return l < r
+        }
+
+        let saved = UserDefaults.standard.string(forKey: "selectedAddress") ?? selectedAddress
+        if let remembered = devices.first(where: { $0.address.lowercased() == saved.lowercased() }) {
+            selectedAddress = remembered.address
+        } else if selectedAddress.isEmpty || !devices.contains(where: { $0.address.lowercased() == selectedAddress.lowercased() }) {
+            if let xiaomi = devices.first(where: { $0.address.lowercased() == "bc-6a-d1-4d-f2-df" }) {
+                selectedAddress = xiaomi.address
+            } else if let first = devices.first {
+                selectedAddress = first.address
+            }
+        }
+        output = "Found \(devices.count) paired Bluetooth device(s). Selected: \(selectedDeviceName)."
+    }
+
+    func run(_ command: String, number: String? = nil) {
+        guard !selectedAddress.isEmpty else {
+            output = "No phone selected."
+            return
+        }
+        let dialNumber = number?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if command == "dial", (dialNumber ?? "").isEmpty {
+            output = "Enter a phone number before pressing Dial."
+            return
+        }
+        let helper = helperPath
+        let address = selectedAddress
+        let logPath = logPath
+        busy = true
+        output = "Running native HFP \(command)…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Self.runHelper(path: helper, command: command, address: address, logPath: logPath, number: dialNumber)
+            DispatchQueue.main.async {
+                self.busy = false
+                let trimmed = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.output = trimmed.isEmpty ? "Done (exit \(result.exitCode))." : trimmed
+                self.refreshLog()
+            }
+        }
+    }
+
+    func call(_ number: String) {
+        dialNumber = number
+        run("dial", number: number)
+    }
+
+    func refreshLog() {
+        if let text = try? String(contentsOfFile: logPath, encoding: .utf8) {
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+            logText = lines.suffix(140).joined(separator: "\n")
+        } else {
+            logText = "No log yet: \(logPath)"
+        }
+    }
+
+    func saveCompanionSettings() {
+        UserDefaults.standard.set(companionURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "companionURL")
+        UserDefaults.standard.set(companionToken.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "companionToken")
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            try LaunchAgentManager.setEnabled(enabled)
+            launchAtLoginEnabled = LaunchAgentManager.isEnabled()
+            monitorStatus = launchAtLoginEnabled ? "Launch at login enabled." : "Launch at login disabled."
+        } catch {
+            launchAtLoginEnabled = LaunchAgentManager.isEnabled()
+            monitorStatus = "Launch-at-login update failed: \(error.localizedDescription)"
+        }
+    }
+
+    func setMonitoringEnabled(_ enabled: Bool) {
+        monitoringEnabled = enabled
+        monitorStatus = enabled ? "Resident monitor enabled." : "Resident monitor disabled."
+    }
+
+    func requestNotificationAccess() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            DispatchQueue.main.async {
+                if let error {
+                    self.monitorStatus = "Notification permission error: \(error.localizedDescription)"
+                } else if !granted {
+                    self.monitorStatus = "Notifications are not allowed yet; using legacy macOS fallback."
+                }
+            }
+        }
+    }
+
+    func startMonitoring() {
+        monitorTimer?.invalidate()
+        monitorTimer = Timer.scheduledTimer(timeInterval: 8, target: self, selector: #selector(monitorTimerFired(_:)), userInfo: nil, repeats: true)
+        monitorStatus = "Resident monitor active."
+        pollResidentStatus()
+    }
+
+    @objc private func monitorTimerFired(_ timer: Timer) {
+        pollResidentStatus()
+    }
+
+    func stopMonitoring() {
+        monitorTimer?.invalidate()
+        monitorTimer = nil
+        monitorStatus = "Resident monitor disabled."
+    }
+
+    func autoConnectSelectedPhone() {
+        guard !selectedAddress.isEmpty else {
+            monitorStatus = "No remembered phone available."
+            return
+        }
+        pollCallState(reason: "Auto-connecting to \(selectedDeviceName)…")
+    }
+
+    private func pollResidentStatus() {
+        guard monitoringEnabled else { return }
+        refreshDevices()
+        if !selectedAddress.isEmpty { pollCallState(reason: nil) }
+        if Date().timeIntervalSince(lastMessagePoll) >= 18 {
+            lastMessagePoll = Date()
+            pollMessagesForNotifications()
+        }
+    }
+
+    private func pollCallState(reason: String?) {
+        guard !selectedAddress.isEmpty, !isPollingCall else { return }
+        let helper = helperPath
+        let address = selectedAddress
+        let logPath = logPath
+        isPollingCall = true
+        if let reason { monitorStatus = reason }
+        DispatchQueue.global(qos: .utility).async {
+            let result = Self.runHelper(path: helper, command: "status", address: address, logPath: logPath)
+            DispatchQueue.main.async {
+                self.isPollingCall = false
+                guard result.exitCode == 0 else {
+                    self.monitorStatus = "Phone monitor failed: \(result.text.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    return
+                }
+                let text = result.text
+                let incoming = text.contains("callSetupMode=1") || text.localizedCaseInsensitiveContains("incoming")
+                if incoming && !self.incomingCallNotified {
+                    self.incomingCallNotified = true
+                    self.appendAppLog("Incoming call detected; requesting notification")
+                    self.postNotification(title: "Incoming call", subtitle: self.selectedDeviceName, body: "OpenCall detected an incoming mobile call.", identifier: "opencall.incoming-call")
+                    self.monitorStatus = "Incoming call detected."
+                } else if !incoming {
+                    self.incomingCallNotified = false
+                    self.monitorStatus = "Monitoring \(self.selectedDeviceName)."
+                }
+            }
+        }
+    }
+
+    private func pollMessagesForNotifications() {
+        guard !isPollingMessages else { return }
+        let base = companionURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = companionToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !base.isEmpty, !base.contains("PHONE-IP"), !token.isEmpty else { return }
+        isPollingMessages = true
+        fetch("sms", as: SmsResponse.self, limit: 25) { result in
+            self.isPollingMessages = false
+            switch result {
+            case .success(let response) where response.ok:
+                let fetched = response.messages ?? []
+                self.messages = fetched
+                let newest = fetched.map(\.date).max() ?? self.lastSeenMessageDate
+                if !self.messageBaselinePrimed {
+                    self.messageBaselinePrimed = true
+                    self.lastSeenMessageDate = max(self.lastSeenMessageDate, newest)
+                    UserDefaults.standard.set(self.lastSeenMessageDate, forKey: "lastSeenMessageDate")
+                    return
+                }
+                let newIncoming = fetched
+                    .filter { $0.type == "inbox" && $0.date > self.lastSeenMessageDate }
+                    .sorted { $0.date < $1.date }
+                for message in newIncoming.prefix(3) {
+                    self.postNotification(title: "New mobile message", subtitle: message.address, body: self.notificationSnippet(message.body), identifier: "opencall.sms.\(message.id)")
+                }
+                if newIncoming.count > 3 {
+                    self.postNotification(title: "New mobile messages", subtitle: self.selectedDeviceName, body: "\(newIncoming.count) new SMS messages received.", identifier: "opencall.sms.summary.\(newest)")
+                }
+                if newest > self.lastSeenMessageDate {
+                    self.lastSeenMessageDate = newest
+                    UserDefaults.standard.set(newest, forKey: "lastSeenMessageDate")
+                }
+            case .success(let response):
+                self.monitorStatus = "Message monitor failed: \(response.error ?? "unknown error")"
+            case .failure(let error):
+                self.monitorStatus = "Message monitor failed: \(error.message)"
+            }
+        }
+    }
+
+    private func notificationSnippet(_ text: String) -> String {
+        let clean = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.count <= 120 { return clean }
+        return String(clean.prefix(117)) + "…"
+    }
+
+    func sendTestNotification() {
+        postNotification(title: "OpenCall notifications working", subtitle: selectedDeviceName, body: "This is a test Mac notification from OpenCall.", identifier: "opencall.test.\(Int(Date().timeIntervalSince1970))")
+    }
+
+    private func postNotification(title: String, subtitle: String, body: String, identifier: String) {
+        appendAppLog("Notification requested: \(title) id=\(identifier)")
+
+        // Use several system delivery paths, then always show our own small
+        // floating banner. Notification Center can silently suppress unsigned
+        // LSUIElement apps, but the in-app banner is under our control.
+        let legacy = NSUserNotification()
+        legacy.identifier = identifier
+        legacy.title = title
+        legacy.subtitle = subtitle
+        legacy.informativeText = body
+        legacy.soundName = NSUserNotificationDefaultSoundName
+        NSUserNotificationCenter.default.deliver(legacy)
+        appendAppLog("NSUserNotification delivered: \(identifier)")
+
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.subtitle = subtitle
+        content.body = body
+        content.sound = .default
+        content.threadIdentifier = "OpenCall"
+        let request = UNNotificationRequest(identifier: identifier + ".un", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { error in
+            DispatchQueue.main.async {
+                if let error {
+                    self.appendAppLog("UNUserNotification failed: \(error.localizedDescription)")
+                    self.monitorStatus = "Notification fallback used: \(error.localizedDescription)"
+                } else {
+                    self.appendAppLog("UNUserNotification queued: \(identifier)")
+                }
+            }
+        }
+
+        deliverAppleScriptNotification(title: title, subtitle: subtitle, body: body)
+        showFloatingNotification(title: title, subtitle: subtitle, body: body)
+        NSSound(named: NSSound.Name("Glass"))?.play()
+        monitorStatus = "Notification sent: \(title)"
+    }
+
+    private func showFloatingNotification(title: String, subtitle: String, body: String) {
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 390, height: 118),
+                            styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered,
+                            defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .transient]
+        panel.hidesOnDeactivate = false
+        panel.contentView = NSHostingView(rootView: NotificationBannerView(title: title, subtitle: subtitle, message: body))
+
+        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let offset = CGFloat(min(notificationPanels.count, 3)) * 130
+        panel.setFrameOrigin(NSPoint(x: screen.maxX - 410, y: screen.maxY - 136 - offset))
+        notificationPanels.append(panel)
+        panel.orderFrontRegardless()
+        appendAppLog("Floating banner shown: \(title)")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 9) { [weak panel, weak self] in
+            guard let panel, let self else { return }
+            panel.orderOut(nil)
+            panel.close()
+            self.notificationPanels.removeAll { $0 === panel }
+        }
+    }
+
+    private func deliverAppleScriptNotification(title: String, subtitle: String, body: String) {
+        let escapedTitle = Self.appleScriptLiteral(title)
+        let escapedSubtitle = Self.appleScriptLiteral(subtitle)
+        let escapedBody = Self.appleScriptLiteral(body)
+        let script = "display notification \"\(escapedBody)\" with title \"\(escapedTitle)\" subtitle \"\(escapedSubtitle)\" sound name \"Glass\""
+        DispatchQueue.global(qos: .utility).async {
+            let task = Process()
+            let pipe = Pipe()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            task.arguments = ["-e", script]
+            task.standardError = pipe
+            do {
+                try task.run()
+                task.waitUntilExit()
+                let errorText = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                DispatchQueue.main.async {
+                    if task.terminationStatus == 0 {
+                        self.appendAppLog("AppleScript notification delivered: \(title)")
+                    } else {
+                        self.appendAppLog("AppleScript notification failed: exit=\(task.terminationStatus) \(errorText.trimmingCharacters(in: .whitespacesAndNewlines))")
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.appendAppLog("AppleScript notification failed to launch: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func appendAppLog(_ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "h:mm:ss a"
+        let line = "[\(formatter.string(from: Date()))] OpenCallMac: \(message)\n"
+        let url = URL(fileURLWithPath: logPath)
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: url.path), let handle = try? FileHandle(forWritingTo: url) {
+                try handle.seekToEnd()
+                if let data = line.data(using: .utf8) { try handle.write(contentsOf: data) }
+                try handle.close()
+            } else {
+                try line.write(to: url, atomically: true, encoding: .utf8)
+            }
+        } catch {
+            NSLog("OpenCall log write failed: \(error.localizedDescription)")
+        }
+    }
+
+    nonisolated private static func appleScriptLiteral(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
+    }
+
+    func discoverCompanionByBluetooth() {
+        guard !selectedAddress.isEmpty else {
+            syncStatus = "Select the paired Android phone first."
+            return
+        }
+        let helper = btHelperPath
+        let address = selectedAddress
+        busy = true
+        syncStatus = "Discovering companion over Bluetooth…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Self.runBluetoothHelper(path: helper, address: address)
+            DispatchQueue.main.async {
+                self.busy = false
+                guard result.exitCode == 0 else {
+                    let message = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.syncStatus = "Bluetooth discovery failed: \(message.isEmpty ? "helper exit \(result.exitCode)" : message)"
+                    return
+                }
+                guard let jsonLine = result.stdout.split(separator: "\n").first(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{") }) else {
+                    self.syncStatus = "Bluetooth discovery failed: no metadata returned."
+                    return
+                }
+                do {
+                    let metadata = try JSONDecoder().decode(CompanionMetadata.self, from: Data(String(jsonLine).utf8))
+                    guard metadata.ok != false,
+                          let url = metadata.url?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty,
+                          let token = metadata.token?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else {
+                        self.syncStatus = "Bluetooth discovery returned incomplete metadata."
+                        return
+                    }
+                    self.companionURL = url
+                    self.companionToken = token
+                    self.saveCompanionSettings()
+                    self.syncStatus = "Discovered OpenCall Companion over Bluetooth. URL/token filled."
+                    self.syncHealth()
+                } catch {
+                    self.syncStatus = "Bluetooth discovery decode failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func syncHealth() {
+        saveCompanionSettings()
+        syncStatus = "Checking companion health…"
+        fetch("health", as: HealthResponse.self, requiresToken: false) { result in
+            switch result {
+            case .success(let health):
+                let missing = (health.missingPermissions ?? []).joined(separator: ", ")
+                let bt = health.bluetoothRunning == true ? "BT discovery on" : "BT discovery off"
+                self.syncStatus = "Companion \(health.running == true ? "running" : "reachable") on port \(health.port ?? 0); \(bt). Missing: \(missing.isEmpty ? "none" : missing)."
+            case .failure(let error):
+                self.syncStatus = "Health failed: \(error)"
+            }
+        }
+    }
+
+    func syncContacts() {
+        saveCompanionSettings()
+        syncStatus = "Syncing contacts…"
+        fetch("contacts", as: ContactsResponse.self) { result in
+            switch result {
+            case .success(let response) where response.ok:
+                self.contacts = response.contacts ?? []
+                self.syncStatus = "Loaded \(self.contacts.count) contacts."
+            case .success(let response):
+                self.syncStatus = "Contacts failed: \(response.error ?? "unknown error")"
+            case .failure(let error):
+                self.syncStatus = "Contacts failed: \(error)"
+            }
+        }
+    }
+
+    func syncCalls() {
+        saveCompanionSettings()
+        syncStatus = "Syncing recent calls…"
+        fetch("calls", as: CallsResponse.self, limit: 100) { result in
+            switch result {
+            case .success(let response) where response.ok:
+                self.recentCalls = response.calls ?? []
+                self.syncStatus = "Loaded \(self.recentCalls.count) recent calls."
+            case .success(let response):
+                self.syncStatus = "Recent calls failed: \(response.error ?? "unknown error")"
+            case .failure(let error):
+                self.syncStatus = "Recent calls failed: \(error)"
+            }
+        }
+    }
+
+    func syncMessages() {
+        saveCompanionSettings()
+        syncStatus = "Syncing SMS messages…"
+        fetch("sms", as: SmsResponse.self, limit: 100) { result in
+            switch result {
+            case .success(let response) where response.ok:
+                self.messages = response.messages ?? []
+                self.syncStatus = "Loaded \(self.messages.count) SMS messages."
+            case .success(let response):
+                self.syncStatus = "Messages failed: \(response.error ?? "unknown error")"
+            case .failure(let error):
+                self.syncStatus = "Messages failed: \(error)"
+            }
+        }
+    }
+
+    func syncAll() {
+        syncHealth()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.syncContacts() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) { self.syncCalls() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { self.syncMessages() }
+    }
+
+    private func fetch<T: Decodable>(_ endpoint: String, as type: T.Type, limit: Int? = nil, requiresToken: Bool = true, completion: @escaping (Result<T, SyncError>) -> Void) {
+        let base = companionURL.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !base.isEmpty, base.contains("://") else {
+            completion(.failure(SyncError("Enter companion URL, e.g. http://PHONE-IP:9096")))
+            return
+        }
+        var components = URLComponents(string: base + "/" + endpoint)
+        var items: [URLQueryItem] = []
+        let token = companionToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if requiresToken {
+            guard !token.isEmpty else {
+                completion(.failure(SyncError("Enter companion token")))
+                return
+            }
+            items.append(URLQueryItem(name: "token", value: token))
+        }
+        if let limit { items.append(URLQueryItem(name: "limit", value: String(limit))) }
+        if !items.isEmpty { components?.queryItems = items }
+        guard let url = components?.url else {
+            completion(.failure(SyncError("Bad companion URL")))
+            return
+        }
+        var request = URLRequest(url: url, timeoutInterval: 8)
+        if !token.isEmpty { request.setValue(token, forHTTPHeaderField: "X-OpenCall-Token") }
+        URLSession.shared.dataTask(with: request) { data, _, error in
+            if let error {
+                DispatchQueue.main.async { completion(.failure(SyncError(error.localizedDescription))) }
+                return
+            }
+            guard let data else {
+                DispatchQueue.main.async { completion(.failure(SyncError("No response data"))) }
+                return
+            }
+            do {
+                let decoded = try JSONDecoder().decode(T.self, from: data)
+                DispatchQueue.main.async { completion(.success(decoded)) }
+            } catch {
+                let raw = String(data: data, encoding: .utf8) ?? ""
+                DispatchQueue.main.async { completion(.failure(SyncError("Decode failed: \(error.localizedDescription) \(raw)"))) }
+            }
+        }.resume()
+    }
+
+    nonisolated static func runBluetoothHelper(path: String, address: String) -> ProcessOutput {
+        let task = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        task.executableURL = URL(fileURLWithPath: path)
+        task.arguments = ["--address", address, "--timeout", "10"]
+        task.standardOutput = stdout
+        task.standardError = stderr
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let out = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let err = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return ProcessOutput(stdout: out, stderr: err, exitCode: task.terminationStatus)
+        } catch {
+            return ProcessOutput(stdout: "", stderr: "Failed to run btmeta: \(error.localizedDescription)", exitCode: 1)
+        }
+    }
+
+    nonisolated static func runHelper(path: String, command: String, address: String, logPath: String, number: String? = nil) -> CommandResult {
+        let task = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        task.executableURL = URL(fileURLWithPath: path)
+        var arguments = [command, "--address", address, "--log", logPath]
+        if let number, !number.isEmpty { arguments += ["--number", number] }
+        task.arguments = arguments
+        task.standardOutput = stdout
+        task.standardError = stderr
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let out = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let err = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return CommandResult(text: [out, err].filter { !$0.isEmpty }.joined(separator: "\n"), exitCode: task.terminationStatus)
+        } catch {
+            return CommandResult(text: "Failed to run hfpctl: \(error.localizedDescription)", exitCode: 1)
+        }
+    }
+}
+
+struct NotificationBannerView: View {
+    let title: String
+    let subtitle: String
+    let message: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: title.localizedCaseInsensitiveContains("message") ? "message.fill" : "phone.fill")
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(width: 38, height: 38)
+                .background(Circle().fill(Color.accentColor))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                if !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Text(message)
+                    .font(.subheadline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .frame(width: 390, height: 118, alignment: .topLeading)
+        .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Color.primary.opacity(0.10), lineWidth: 1))
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSUserNotificationCenterDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        UNUserNotificationCenter.current().delegate = self
+        NSUserNotificationCenter.default.delegate = self
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound, .list])
+    }
+
+    func userNotificationCenter(_ center: NSUserNotificationCenter, shouldPresent notification: NSUserNotification) -> Bool {
+        true
+    }
+}
+
+@main
+struct OpenCallMacApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var model = AppModel()
+
+    var body: some Scene {
+        WindowGroup("OpenCall Mac", id: "main") {
+            ContentView(model: model).frame(width: 900, height: 830)
+        }
+        .windowResizability(.contentSize)
+
+        MenuBarExtra {
+            MenuBarView(model: model)
+        } label: {
+            MenuBarIconView()
+        }
+        .menuBarExtraStyle(.menu)
+    }
+}
+
+struct MenuBarIconView: View {
+    var body: some View {
+        Image(systemName: "phone.fill")
+            .symbolRenderingMode(.monochrome)
+            .imageScale(.medium)
+    }
+}
+
+struct MenuBarView: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Show OpenCall") {
+            openWindow(id: "main")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        Divider()
+        Text(model.selectedDeviceName.isEmpty ? "No phone selected" : model.selectedDeviceName)
+        Text(model.monitorStatus)
+        Divider()
+        Button("Check HFP") { model.autoConnectSelectedPhone() }
+        Button("Sync All") { model.syncAll() }
+        Button("Auto via Bluetooth") { model.discoverCompanionByBluetooth() }
+        Button("Test Notification") { model.sendTestNotification() }
+        Divider()
+        Toggle("Monitor calls/messages", isOn: Binding(get: { model.monitoringEnabled }, set: { model.setMonitoringEnabled($0) }))
+        Toggle("Launch at Login", isOn: Binding(get: { model.launchAtLoginEnabled }, set: { model.setLaunchAtLogin($0) }))
+        Divider()
+        Button("Quit OpenCall") { NSApp.terminate(nil) }
+    }
+}
+
+struct ContentView: View {
+    @ObservedObject var model: AppModel
+    private let timer = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            header
+            phonePicker
+            dialControls
+            callControls
+            residentControls
+            companionPanel
+            logPanel
+        }
+        .padding(18)
+        .onReceive(timer) { _ in model.refreshLog() }
+    }
+
+    private var header: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("OpenCall Mac")
+                    .font(.title2.weight(.semibold))
+                Text("Native HFP call control + Android companion sync")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if model.busy { ProgressView().controlSize(.small) }
+        }
+    }
+
+    private var phonePicker: some View {
+        HStack {
+            Picker("Phone", selection: $model.selectedAddress) {
+                ForEach(model.devices) { device in Text(device.displayName).tag(device.address) }
+            }
+            .frame(maxWidth: .infinity)
+            Button("Refresh Devices") { model.refreshDevices() }
+        }
+    }
+
+    private var dialControls: some View {
+        HStack(spacing: 12) {
+            TextField("Phone number", text: $model.dialNumber)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.body, design: .monospaced))
+                .onSubmit { model.run("dial", number: model.dialNumber) }
+            Button { model.run("dial", number: model.dialNumber) } label: {
+                Label("Dial", systemImage: "phone.arrow.up.right").frame(width: 110)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .disabled(model.busy || model.dialNumber.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
+    private var callControls: some View {
+        HStack(spacing: 12) {
+            Button { model.run("status") } label: {
+                Label("Check HFP", systemImage: "antenna.radiowaves.left.and.right").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .disabled(model.busy)
+
+            Button { model.run("answer") } label: {
+                Label("Answer", systemImage: "phone.fill.arrow.up.right").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .keyboardShortcut(.defaultAction)
+            .disabled(model.busy)
+
+            Button(role: .destructive) { model.run("hangup") } label: {
+                Label("Hang Up", systemImage: "phone.down.fill").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .disabled(model.busy)
+        }
+    }
+
+    private var residentControls: some View {
+        GroupBox("Resident Menu Bar Monitor") {
+            HStack(spacing: 14) {
+                Toggle("Launch at login", isOn: Binding(get: { model.launchAtLoginEnabled }, set: { model.setLaunchAtLogin($0) }))
+                Toggle("Monitor calls/messages", isOn: Binding(get: { model.monitoringEnabled }, set: { model.setMonitoringEnabled($0) }))
+                Button("Auto-connect now") { model.autoConnectSelectedPhone() }
+                    .disabled(model.selectedAddress.isEmpty)
+                Button("Test notification") { model.sendTestNotification() }
+                Spacer()
+                Text(model.monitorStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: 320, alignment: .trailing)
+            }
+        }
+    }
+
+    private var companionPanel: some View {
+        GroupBox("Android Companion") {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    TextField("http://PHONE-IP:9096", text: $model.companionURL)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.caption, design: .monospaced))
+                    TextField("Token", text: $model.companionToken)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(width: 230)
+                }
+                HStack(spacing: 10) {
+                    Button("Auto via Bluetooth") { model.discoverCompanionByBluetooth() }
+                        .disabled(model.busy || model.selectedAddress.isEmpty)
+                    Button("Health") { model.syncHealth() }
+                    Button("Contacts") { model.syncContacts() }
+                    Button("Recents") { model.syncCalls() }
+                    Button("Messages") { model.syncMessages() }
+                    Button("Sync All") { model.syncAll() }
+                    Spacer()
+                    Text(model.syncStatus).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                }
+                TabView {
+                    contactsView.tabItem { Text("Contacts (\(model.contacts.count))") }
+                    recentsView.tabItem { Text("Recents (\(model.recentCalls.count))") }
+                    messagesView.tabItem { Text("Messages (\(model.messages.count))") }
+                }
+                .frame(height: 260)
+            }
+        }
+    }
+
+    private var contactsView: some View {
+        List(model.contacts) { contact in
+            VStack(alignment: .leading, spacing: 5) {
+                Text(contact.name.isEmpty ? "Unnamed" : contact.name).font(.headline)
+                ForEach(contact.numbers) { number in
+                    HStack {
+                        Text(number.label).foregroundStyle(.secondary).frame(width: 80, alignment: .leading)
+                        Text(number.number).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        Spacer()
+                        Button("Call") { model.call(number.number) }
+                    }
+                }
+            }
+            .padding(.vertical, 3)
+        }
+    }
+
+    private var recentsView: some View {
+        List(model.recentCalls) { call in
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text((call.name?.isEmpty == false ? call.name! : call.number)).font(.headline)
+                    Text("\(call.type) • \(formatMillis(call.date)) • \(call.duration)s")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(call.number).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                }
+                Spacer()
+                Button("Call") { model.call(call.number) }
+            }
+            .padding(.vertical, 3)
+        }
+    }
+
+    private var messagesView: some View {
+        List(model.messages) { message in
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(message.address).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    Text(message.type).font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Text(formatMillis(message.date)).font(.caption).foregroundStyle(.secondary)
+                    Button("Call") { model.call(message.address) }
+                }
+                Text(message.body).lineLimit(3).textSelection(.enabled)
+            }
+            .padding(.vertical, 3)
+        }
+    }
+
+    private var logPanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Last command")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            ScrollView {
+                Text(model.output)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(10)
+            }
+            .frame(height: 92)
+            .background(Color(nsColor: .textBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            HStack {
+                Text("Log: ~/opencall-mac/logs/hfp.log")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Reload Log") { model.refreshLog() }
+            }
+            ScrollView {
+                Text(model.logText)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(10)
+            }
+            .frame(height: 115)
+            .background(Color(nsColor: .textBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    private func formatMillis(_ millis: Int64) -> String {
+        guard millis > 0 else { return "unknown" }
+        return Date(timeIntervalSince1970: TimeInterval(millis) / 1000.0).formatted(date: .abbreviated, time: .shortened)
+    }
+}

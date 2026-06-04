@@ -1,0 +1,8 @@
+build/
+logs/
+.DS_Store
+*.xcuserstate
+android-companion/build/
+apk/*.apk
+apk/*.idsig
+apk/*.keystore
