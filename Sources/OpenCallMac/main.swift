@@ -179,6 +179,9 @@ final class AppModel: NSObject, ObservableObject {
     private var isPollingCall = false
     private var isPollingMessages = false
     private var incomingCallNotified = false
+    private var activeCallNotified = false
+    private var lastIncomingNotificationAt = Date.distantPast
+    private var lastActiveCallNotificationAt = Date.distantPast
     private var lastSeenMessageDate = UserDefaults.standard.object(forKey: "lastSeenMessageDate") as? Int64 ?? 0
     private var messageBaselinePrimed = UserDefaults.standard.object(forKey: "lastSeenMessageDate") != nil
     private var lastMessagePoll = Date.distantPast
@@ -370,14 +373,33 @@ final class AppModel: NSObject, ObservableObject {
                     return
                 }
                 let text = result.text
-                let incoming = text.contains("callSetupMode=1") || text.localizedCaseInsensitiveContains("incoming")
-                if incoming && !self.incomingCallNotified {
+                let incoming = text.contains("callSetupMode=1") || text.contains("ringAttempt=") || text.contains("incomingCallFrom=")
+                let active = text.contains("isCallActive=1")
+                let now = Date()
+                let shouldNotifyIncoming = incoming && (!self.incomingCallNotified || now.timeIntervalSince(self.lastIncomingNotificationAt) > 20)
+                let shouldNotifyActive = active && (!self.activeCallNotified || now.timeIntervalSince(self.lastActiveCallNotificationAt) > 60)
+                if shouldNotifyIncoming {
                     self.incomingCallNotified = true
+                    self.lastIncomingNotificationAt = now
                     self.appendAppLog("Incoming call detected; requesting notification")
-                    self.postNotification(title: "Incoming call", subtitle: self.selectedDeviceName, body: "OpenCall detected an incoming mobile call.", identifier: "opencall.incoming-call")
+                    self.postNotification(title: "Incoming call", subtitle: self.selectedDeviceName, body: "OpenCall detected an incoming mobile call.", identifier: "opencall.incoming-call.\(Int(now.timeIntervalSince1970))")
                     self.monitorStatus = "Incoming call detected."
-                } else if !incoming {
+                } else if incoming {
+                    self.appendAppLog("Incoming call still ringing; notification already sent/recently suppressed")
+                    self.monitorStatus = "Incoming call detected."
+                } else if shouldNotifyActive {
                     self.incomingCallNotified = false
+                    self.activeCallNotified = true
+                    self.lastActiveCallNotificationAt = now
+                    self.appendAppLog("Active call detected; requesting notification")
+                    self.postNotification(title: "Call active", subtitle: self.selectedDeviceName, body: "OpenCall detected an active mobile call.", identifier: "opencall.active-call.\(Int(now.timeIntervalSince1970))")
+                    self.monitorStatus = "Call active on \(self.selectedDeviceName)."
+                } else if active {
+                    self.incomingCallNotified = false
+                    self.monitorStatus = "Call active on \(self.selectedDeviceName)."
+                } else {
+                    self.incomingCallNotified = false
+                    self.activeCallNotified = false
                     self.monitorStatus = "Monitoring \(self.selectedDeviceName)."
                 }
             }
@@ -481,8 +503,8 @@ final class AppModel: NSObject, ObservableObject {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .transient]
+        panel.level = .screenSaver
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .transient]
         panel.hidesOnDeactivate = false
         panel.contentView = NSHostingView(rootView: NotificationBannerView(title: title, subtitle: subtitle, message: body))
 
@@ -493,7 +515,7 @@ final class AppModel: NSObject, ObservableObject {
         panel.orderFrontRegardless()
         appendAppLog("Floating banner shown: \(title)")
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 9) { [weak panel, weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak panel, weak self] in
             guard let panel, let self else { return }
             panel.orderOut(nil)
             panel.close()
