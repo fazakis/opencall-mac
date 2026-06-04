@@ -8,6 +8,7 @@ import android.net.Uri;
 import android.provider.CallLog;
 import android.provider.ContactsContract;
 import android.provider.Telephony;
+import android.telephony.SmsManager;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -144,6 +145,27 @@ final class DataProvider {
         return out;
     }
 
+    JSONObject sendSms(String number, String text) throws Exception {
+        require(Manifest.permission.SEND_SMS);
+        String cleanNumber = number == null ? "" : number.trim();
+        String body = text == null ? "" : text.trim();
+        if (cleanNumber.isEmpty()) throw new IllegalArgumentException("Missing number");
+        if (body.isEmpty()) throw new IllegalArgumentException("Missing message text");
+        SmsManager manager = context.getSystemService(SmsManager.class);
+        if (manager == null) manager = SmsManager.getDefault();
+        java.util.ArrayList<String> parts = manager.divideMessage(body);
+        if (parts == null || parts.isEmpty()) {
+            manager.sendTextMessage(cleanNumber, null, body, null, null);
+        } else {
+            manager.sendMultipartTextMessage(cleanNumber, null, parts, null, null);
+        }
+        JSONObject out = ok();
+        out.put("sent", true);
+        out.put("number", cleanNumber);
+        out.put("parts", parts == null || parts.isEmpty() ? 1 : parts.size());
+        return out;
+    }
+
     JSONObject health(String token, boolean running, int port, boolean bluetoothRunning, boolean bleRunning, String bleError) throws Exception {
         JSONObject out = ok();
         out.put("service", "OpenCall Companion");
@@ -160,6 +182,7 @@ final class DataProvider {
         JSONArray missing = new JSONArray();
         if (!hasPermission(Manifest.permission.READ_CONTACTS)) missing.put("READ_CONTACTS");
         if (!hasPermission(Manifest.permission.READ_SMS)) missing.put("READ_SMS");
+        if (!hasPermission(Manifest.permission.SEND_SMS)) missing.put("SEND_SMS");
         if (!hasPermission(Manifest.permission.READ_CALL_LOG)) missing.put("READ_CALL_LOG");
         if (android.os.Build.VERSION.SDK_INT >= 31 && !hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) missing.put("BLUETOOTH_CONNECT");
         if (android.os.Build.VERSION.SDK_INT >= 31 && !hasPermission(Manifest.permission.BLUETOOTH_ADVERTISE)) missing.put("BLUETOOTH_ADVERTISE");

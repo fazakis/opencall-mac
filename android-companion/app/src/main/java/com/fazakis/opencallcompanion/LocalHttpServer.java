@@ -84,6 +84,7 @@ final class LocalHttpServer {
             if (request == null || request.isEmpty()) return;
             String[] parts = request.split(" ");
             if (parts.length < 2) { respond(out, 400, error("bad_request")); return; }
+            String method = parts[0].toUpperCase();
             String target = parts[1];
             String path = target;
             String query = "";
@@ -96,6 +97,7 @@ final class LocalHttpServer {
                 int colon = line.indexOf(':');
                 if (colon > 0) headers.put(line.substring(0, colon).trim().toLowerCase(), line.substring(colon + 1).trim());
             }
+            String body = readBody(in, headers);
 
             if ("/".equals(path) || "/health".equals(path)) {
                 respond(out, 200, provider.health(token(), running, PORT, OpenCallCompanionService.bluetoothMetaServer(context).isRunning(), OpenCallCompanionService.bleMetaServer(context).isRunning(), OpenCallCompanionService.bleMetaServer(context).lastError()));
@@ -113,6 +115,13 @@ final class LocalHttpServer {
                 if ("/contacts".equals(path)) respond(out, 200, provider.contacts());
                 else if ("/calls".equals(path) || "/recents".equals(path)) respond(out, 200, provider.calls(limit));
                 else if ("/sms".equals(path) || "/messages".equals(path)) respond(out, 200, provider.sms(limit));
+                else if ("/send-sms".equals(path) || "/sms/send".equals(path)) {
+                    if (!"POST".equals(method)) { respond(out, 405, error("method_not_allowed")); return; }
+                    JSONObject input = body == null || body.trim().isEmpty() ? new JSONObject() : new JSONObject(body);
+                    String number = input.optString("number", params.get("number"));
+                    String text = input.optString("text", params.get("text"));
+                    respond(out, 200, provider.sendSms(number, text));
+                }
                 else respond(out, 404, error("not_found"));
             } catch (SecurityException se) {
                 respond(out, 403, error(se.getMessage()));
@@ -123,9 +132,23 @@ final class LocalHttpServer {
         }
     }
 
+    private static String readBody(BufferedReader in, Map<String, String> headers) throws Exception {
+        int length = 0;
+        try { length = Integer.parseInt(headers.getOrDefault("content-length", "0")); } catch (Exception ignored) {}
+        if (length <= 0) return "";
+        char[] chars = new char[Math.min(length, 64 * 1024)];
+        int total = 0;
+        while (total < chars.length) {
+            int read = in.read(chars, total, chars.length - total);
+            if (read < 0) break;
+            total += read;
+        }
+        return new String(chars, 0, total);
+    }
+
     private void respond(OutputStream out, int status, JSONObject json) throws Exception {
         byte[] body = json.toString().getBytes(StandardCharsets.UTF_8);
-        String reason = status == 200 ? "OK" : status == 400 ? "Bad Request" : status == 401 ? "Unauthorized" : status == 403 ? "Forbidden" : status == 404 ? "Not Found" : "Error";
+        String reason = status == 200 ? "OK" : status == 400 ? "Bad Request" : status == 401 ? "Unauthorized" : status == 403 ? "Forbidden" : status == 404 ? "Not Found" : status == 405 ? "Method Not Allowed" : "Error";
         ByteArrayOutputStream header = new ByteArrayOutputStream();
         header.write(("HTTP/1.1 " + status + " " + reason + "\r\n").getBytes(StandardCharsets.UTF_8));
         header.write("Content-Type: application/json; charset=utf-8\r\n".getBytes(StandardCharsets.UTF_8));

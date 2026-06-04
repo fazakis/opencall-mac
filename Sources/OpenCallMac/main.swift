@@ -71,6 +71,14 @@ struct SmsResponse: Decodable {
     let error: String?
 }
 
+struct SendSmsResponse: Decodable {
+    let ok: Bool
+    let sent: Bool?
+    let number: String?
+    let parts: Int?
+    let error: String?
+}
+
 struct PhoneContact: Decodable, Identifiable, Hashable {
     let id: String
     let name: String
@@ -99,6 +107,24 @@ struct SmsMessage: Decodable, Identifiable, Hashable {
     let date: Int64
     let type: String
     let read: Bool
+}
+
+enum OpenCallNotificationKind: String {
+    case generic
+    case incomingCall
+    case activeCall
+    case sms
+    case smsSummary
+}
+
+enum OpenCallNotificationCategory {
+    static let incomingCall = "OPENCALL_INCOMING_CALL"
+    static let sms = "OPENCALL_SMS"
+}
+
+enum OpenCallNotificationAction {
+    static let answer = "OPENCALL_ANSWER"
+    static let decline = "OPENCALL_DECLINE"
 }
 
 
@@ -147,6 +173,8 @@ enum LaunchAgentManager {
 
 @MainActor
 final class AppModel: NSObject, ObservableObject {
+    static var shared: AppModel?
+
     @Published var devices: [PhoneDevice] = []
     @Published var selectedAddress = UserDefaults.standard.string(forKey: "selectedAddress") ?? "" {
         didSet {
@@ -186,6 +214,7 @@ final class AppModel: NSObject, ObservableObject {
     private var messageBaselinePrimed = UserDefaults.standard.object(forKey: "lastSeenMessageDate") != nil
     private var lastMessagePoll = Date.distantPast
     private var notificationPanels: [NSPanel] = []
+    private var messagePanels: [NSPanel] = []
 
     let logPath = NSString(string: "~/opencall-mac/logs/hfp.log").expandingTildeInPath
 
@@ -209,6 +238,7 @@ final class AppModel: NSObject, ObservableObject {
 
     override init() {
         super.init()
+        Self.shared = self
         requestNotificationAccess()
         refreshDevices()
         refreshLog()
@@ -311,6 +341,7 @@ final class AppModel: NSObject, ObservableObject {
     }
 
     func requestNotificationAccess() {
+        AppDelegate.configureNotificationCategories()
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
             DispatchQueue.main.async {
                 if let error {
@@ -382,7 +413,7 @@ final class AppModel: NSObject, ObservableObject {
                     self.incomingCallNotified = true
                     self.lastIncomingNotificationAt = now
                     self.appendAppLog("Incoming call detected; requesting notification")
-                    self.postNotification(title: "Incoming call", subtitle: self.selectedDeviceName, body: "OpenCall detected an incoming mobile call.", identifier: "opencall.incoming-call.\(Int(now.timeIntervalSince1970))")
+                    self.postNotification(title: "Incoming call", subtitle: self.selectedDeviceName, body: "OpenCall detected an incoming mobile call.", identifier: "opencall.incoming-call.\(Int(now.timeIntervalSince1970))", kind: .incomingCall)
                     self.monitorStatus = "Incoming call detected."
                 } else if incoming {
                     self.appendAppLog("Incoming call still ringing; notification already sent/recently suppressed")
@@ -392,7 +423,7 @@ final class AppModel: NSObject, ObservableObject {
                     self.activeCallNotified = true
                     self.lastActiveCallNotificationAt = now
                     self.appendAppLog("Active call detected; requesting notification")
-                    self.postNotification(title: "Call active", subtitle: self.selectedDeviceName, body: "OpenCall detected an active mobile call.", identifier: "opencall.active-call.\(Int(now.timeIntervalSince1970))")
+                    self.postNotification(title: "Call active", subtitle: self.selectedDeviceName, body: "OpenCall detected an active mobile call.", identifier: "opencall.active-call.\(Int(now.timeIntervalSince1970))", kind: .activeCall)
                     self.monitorStatus = "Call active on \(self.selectedDeviceName)."
                 } else if active {
                     self.incomingCallNotified = false
@@ -429,10 +460,10 @@ final class AppModel: NSObject, ObservableObject {
                     .filter { $0.type == "inbox" && $0.date > self.lastSeenMessageDate }
                     .sorted { $0.date < $1.date }
                 for message in newIncoming.prefix(3) {
-                    self.postNotification(title: "New mobile message", subtitle: message.address, body: self.notificationSnippet(message.body), identifier: "opencall.sms.\(message.id)")
+                    self.postNotification(title: "New mobile message", subtitle: message.address, body: self.notificationSnippet(message.body), identifier: "opencall.sms.\(message.id)", kind: .sms, sms: message)
                 }
                 if newIncoming.count > 3 {
-                    self.postNotification(title: "New mobile messages", subtitle: self.selectedDeviceName, body: "\(newIncoming.count) new SMS messages received.", identifier: "opencall.sms.summary.\(newest)")
+                    self.postNotification(title: "New mobile messages", subtitle: self.selectedDeviceName, body: "\(newIncoming.count) new SMS messages received.", identifier: "opencall.sms.summary.\(newest)", kind: .smsSummary)
                 }
                 if newest > self.lastSeenMessageDate {
                     self.lastSeenMessageDate = newest
@@ -456,8 +487,26 @@ final class AppModel: NSObject, ObservableObject {
         postNotification(title: "OpenCall notifications working", subtitle: selectedDeviceName, body: "This is a test Mac notification from OpenCall.", identifier: "opencall.test.\(Int(Date().timeIntervalSince1970))")
     }
 
-    private func postNotification(title: String, subtitle: String, body: String, identifier: String) {
+    private func postNotification(title: String,
+                                  subtitle: String,
+                                  body: String,
+                                  identifier: String,
+                                  kind: OpenCallNotificationKind = .generic,
+                                  sms: SmsMessage? = nil) {
         appendAppLog("Notification requested: \(title) id=\(identifier)")
+
+        var userInfo: [String: Any] = [
+            "kind": kind.rawValue,
+            "identifier": identifier
+        ]
+        if let sms {
+            userInfo["smsId"] = sms.id
+            userInfo["smsAddress"] = sms.address
+            userInfo["smsBody"] = sms.body
+            userInfo["smsDate"] = sms.date
+            userInfo["smsType"] = sms.type
+            userInfo["smsRead"] = sms.read
+        }
 
         // Use several system delivery paths, then always show our own small
         // floating banner. Notification Center can silently suppress unsigned
@@ -468,6 +517,13 @@ final class AppModel: NSObject, ObservableObject {
         legacy.subtitle = subtitle
         legacy.informativeText = body
         legacy.soundName = NSUserNotificationDefaultSoundName
+        legacy.userInfo = userInfo
+        if kind == .incomingCall {
+            legacy.hasActionButton = true
+            legacy.actionButtonTitle = "Answer"
+            legacy.otherButtonTitle = "Decline"
+            legacy.additionalActions = [NSUserNotificationAction(identifier: OpenCallNotificationAction.decline, title: "Decline")]
+        }
         NSUserNotificationCenter.default.deliver(legacy)
         appendAppLog("NSUserNotification delivered: \(identifier)")
 
@@ -477,6 +533,15 @@ final class AppModel: NSObject, ObservableObject {
         content.body = body
         content.sound = .default
         content.threadIdentifier = "OpenCall"
+        content.userInfo = userInfo
+        switch kind {
+        case .incomingCall:
+            content.categoryIdentifier = OpenCallNotificationCategory.incomingCall
+        case .sms, .smsSummary:
+            content.categoryIdentifier = OpenCallNotificationCategory.sms
+        default:
+            break
+        }
         let request = UNNotificationRequest(identifier: identifier + ".un", content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request) { error in
             DispatchQueue.main.async {
@@ -490,37 +555,203 @@ final class AppModel: NSObject, ObservableObject {
         }
 
         deliverAppleScriptNotification(title: title, subtitle: subtitle, body: body)
-        showFloatingNotification(title: title, subtitle: subtitle, body: body)
+        showFloatingNotification(title: title, subtitle: subtitle, body: body, kind: kind, sms: sms)
         NSSound(named: NSSound.Name("Glass"))?.play()
         monitorStatus = "Notification sent: \(title)"
     }
 
-    private func showFloatingNotification(title: String, subtitle: String, body: String) {
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 390, height: 118),
-                            styleMask: [.borderless, .nonactivatingPanel],
+    private func showFloatingNotification(title: String,
+                                          subtitle: String,
+                                          body: String,
+                                          kind: OpenCallNotificationKind,
+                                          sms: SmsMessage? = nil) {
+        var panelRef: NSPanel?
+        let hasCallActions = kind == .incomingCall
+        let height: CGFloat = hasCallActions ? 146 : 106
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 390, height: height),
+                            styleMask: [.borderless],
                             backing: .buffered,
                             defer: false)
+        panelRef = panel
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.level = .screenSaver
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .transient]
         panel.hidesOnDeactivate = false
-        panel.contentView = NSHostingView(rootView: NotificationBannerView(title: title, subtitle: subtitle, message: body))
+
+        let dismiss = { [weak self] in
+            guard let self, let panel = panelRef else { return }
+            self.closeNotificationPanel(panel)
+        }
+
+        let tapAction: (() -> Void)? = {
+            if let sms {
+                return { [weak self] in
+                    self?.openSmsMessage(sms)
+                    dismiss()
+                }
+            }
+            if kind == .smsSummary {
+                return { [weak self] in
+                    self?.syncMessages()
+                    self?.showMainWindow()
+                    dismiss()
+                }
+            }
+            return nil
+        }()
+
+        let answerAction: (() -> Void)? = hasCallActions ? { [weak self] in
+            self?.appendAppLog("Incoming-call banner Answer tapped")
+            self?.run("answer")
+            dismiss()
+        } : nil
+
+        let declineAction: (() -> Void)? = hasCallActions ? { [weak self] in
+            self?.appendAppLog("Incoming-call banner Decline tapped")
+            self?.run("hangup")
+            dismiss()
+        } : nil
+
+        panel.contentView = NSHostingView(rootView: NotificationBannerView(title: title,
+                                                                            subtitle: subtitle,
+                                                                            message: body,
+                                                                            height: height,
+                                                                            onTap: tapAction,
+                                                                            primaryActionTitle: hasCallActions ? "Answer" : nil,
+                                                                            primaryAction: answerAction,
+                                                                            secondaryActionTitle: hasCallActions ? "Decline" : nil,
+                                                                            secondaryAction: declineAction))
 
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let offset = CGFloat(min(notificationPanels.count, 3)) * 130
-        panel.setFrameOrigin(NSPoint(x: screen.maxX - 410, y: screen.maxY - 136 - offset))
+        let offset = CGFloat(min(notificationPanels.count, 3)) * (height + 12)
+        panel.setFrameOrigin(NSPoint(x: screen.maxX - 410, y: screen.maxY - height - 18 - offset))
         notificationPanels.append(panel)
         panel.orderFrontRegardless()
         appendAppLog("Floating banner shown: \(title)")
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak panel, weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + (hasCallActions ? 30 : 20)) { [weak panel, weak self] in
             guard let panel, let self else { return }
+            self.closeNotificationPanel(panel)
+        }
+    }
+
+    private func closeNotificationPanel(_ panel: NSPanel) {
+        panel.orderOut(nil)
+        panel.close()
+        notificationPanels.removeAll { $0 === panel }
+    }
+
+    private func showMainWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let window = NSApp.windows.first(where: { $0.title == "OpenCall Mac" || $0.canBecomeKey }) {
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    private func openSmsMessage(_ message: SmsMessage) {
+        appendAppLog("Opening SMS notification: id=\(message.id)")
+        showMainWindow()
+        showSmsMessageWindow(message)
+    }
+
+    private func showSmsMessageWindow(_ message: SmsMessage) {
+        var panelRef: NSPanel?
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 520, height: 470),
+                            styleMask: [.titled, .closable, .fullSizeContentView],
+                            backing: .buffered,
+                            defer: false)
+        panelRef = panel
+        panel.title = "OpenCall SMS"
+        panel.isReleasedWhenClosed = false
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let close = { [weak self] in
+            guard let self, let panel = panelRef else { return }
             panel.orderOut(nil)
             panel.close()
-            self.notificationPanels.removeAll { $0 === panel }
+            self.messagePanels.removeAll { $0 === panel }
         }
+        panel.contentView = NSHostingView(rootView: SmsMessageDetailView(message: message,
+                                                                         onCall: { [weak self] in self?.call(message.address) },
+                                                                         onReply: { [weak self] text, done in
+                                                                             self?.sendSmsReply(to: message.address, text: text, completion: done)
+                                                                         },
+                                                                         onClose: close))
+        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        panel.center()
+        panel.setFrameOrigin(NSPoint(x: max(screen.minX + 20, screen.midX - 260), y: max(screen.minY + 20, screen.midY - 235)))
+        messagePanels.append(panel)
+        panel.makeKeyAndOrderFront(nil)
+        panel.orderFrontRegardless()
+    }
+
+    func handleNotificationResponse(actionIdentifier: String, userInfo: [AnyHashable: Any]) {
+        appendAppLog("Notification response: action=\(actionIdentifier) info=\(userInfo["kind"] ?? "unknown")")
+        switch actionIdentifier {
+        case OpenCallNotificationAction.answer:
+            run("answer")
+            return
+        case OpenCallNotificationAction.decline:
+            run("hangup")
+            return
+        default:
+            break
+        }
+
+        guard let kindValue = userInfo["kind"] as? String,
+              let kind = OpenCallNotificationKind(rawValue: kindValue) else {
+            showMainWindow()
+            return
+        }
+        switch kind {
+        case .sms:
+            if let message = Self.smsMessage(from: userInfo) {
+                openSmsMessage(message)
+            } else {
+                showMainWindow()
+            }
+        case .smsSummary:
+            syncMessages()
+            showMainWindow()
+        default:
+            showMainWindow()
+        }
+    }
+
+    func handleLegacyNotificationActivation(_ notification: NSUserNotification) {
+        switch notification.activationType {
+        case .actionButtonClicked:
+            appendAppLog("Legacy notification Answer clicked")
+            run("answer")
+        case .additionalActionClicked:
+            if notification.additionalActivationAction?.identifier == OpenCallNotificationAction.decline {
+                appendAppLog("Legacy notification Decline clicked")
+                run("hangup")
+            }
+        case .contentsClicked:
+            handleNotificationResponse(actionIdentifier: UNNotificationDefaultActionIdentifier, userInfo: notification.userInfo ?? [:])
+        default:
+            break
+        }
+    }
+
+    nonisolated private static func smsMessage(from userInfo: [AnyHashable: Any]) -> SmsMessage? {
+        guard let id = userInfo["smsId"] as? String,
+              let address = userInfo["smsAddress"] as? String,
+              let body = userInfo["smsBody"] as? String else { return nil }
+        let date: Int64
+        if let value = userInfo["smsDate"] as? Int64 {
+            date = value
+        } else if let value = userInfo["smsDate"] as? NSNumber {
+            date = value.int64Value
+        } else {
+            date = Int64(Date().timeIntervalSince1970 * 1000)
+        }
+        let type = userInfo["smsType"] as? String ?? "inbox"
+        let read = (userInfo["smsRead"] as? Bool) ?? (userInfo["smsRead"] as? NSNumber)?.boolValue ?? false
+        return SmsMessage(id: id, address: address, body: body, date: date, type: type, read: read)
     }
 
     private func deliverAppleScriptNotification(title: String, subtitle: String, body: String) {
@@ -691,6 +922,80 @@ final class AppModel: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { self.syncMessages() }
     }
 
+    func sendSmsReply(to number: String, text: String, completion: @escaping (String) -> Void) {
+        let cleanNumber = number.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanNumber.isEmpty else {
+            completion("No recipient number.")
+            return
+        }
+        guard !cleanText.isEmpty else {
+            completion("Type a reply first.")
+            return
+        }
+        let base = companionURL.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !base.isEmpty, base.contains("://") else {
+            completion("Enter companion URL first.")
+            return
+        }
+        let token = companionToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            completion("Enter companion token first.")
+            return
+        }
+        var components = URLComponents(string: base + "/send-sms")
+        components?.queryItems = [
+            URLQueryItem(name: "token", value: token),
+            URLQueryItem(name: "number", value: cleanNumber),
+            URLQueryItem(name: "text", value: cleanText)
+        ]
+        guard let url = components?.url else {
+            completion("Bad companion URL.")
+            return
+        }
+        var request = URLRequest(url: url, timeoutInterval: 12)
+        request.httpMethod = "POST"
+        request.setValue(token, forHTTPHeaderField: "X-OpenCall-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        appendAppLog("Sending SMS reply to [number]; chars=\(cleanText.count)")
+        URLSession.shared.dataTask(with: request) { data, _, error in
+            if let error {
+                DispatchQueue.main.async {
+                    self.appendAppLog("SMS reply failed: \(error.localizedDescription)")
+                    completion("Send failed: \(error.localizedDescription)")
+                }
+                return
+            }
+            guard let data else {
+                DispatchQueue.main.async {
+                    self.appendAppLog("SMS reply failed: no response")
+                    completion("Send failed: no response")
+                }
+                return
+            }
+            do {
+                let decoded = try JSONDecoder().decode(SendSmsResponse.self, from: data)
+                DispatchQueue.main.async {
+                    if decoded.ok && decoded.sent == true {
+                        self.appendAppLog("SMS reply sent; parts=\(decoded.parts ?? 1)")
+                        self.syncMessages()
+                        completion("Sent")
+                    } else {
+                        let message = decoded.error ?? "unknown error"
+                        self.appendAppLog("SMS reply failed: \(message)")
+                        completion("Send failed: \(message)")
+                    }
+                }
+            } catch {
+                let raw = String(data: data, encoding: .utf8) ?? ""
+                DispatchQueue.main.async {
+                    self.appendAppLog("SMS reply decode failed: \(error.localizedDescription) \(raw)")
+                    completion("Send failed: \(raw.isEmpty ? error.localizedDescription : raw)")
+                }
+            }
+        }.resume()
+    }
+
     private func fetch<T: Decodable>(_ endpoint: String, as type: T.Type, limit: Int? = nil, requiresToken: Bool = true, completion: @escaping (Result<T, SyncError>) -> Void) {
         let base = companionURL.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard !base.isEmpty, base.contains("://") else {
@@ -779,41 +1084,208 @@ struct NotificationBannerView: View {
     let title: String
     let subtitle: String
     let message: String
+    let height: CGFloat
+    let onTap: (() -> Void)?
+    let primaryActionTitle: String?
+    let primaryAction: (() -> Void)?
+    let secondaryActionTitle: String?
+    let secondaryAction: (() -> Void)?
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: title.localizedCaseInsensitiveContains("message") ? "message.fill" : "phone.fill")
-                .font(.title2.weight(.semibold))
-                .foregroundStyle(.white)
-                .frame(width: 38, height: 38)
-                .background(Circle().fill(Color.accentColor))
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title)
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-                if !subtitle.isEmpty {
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: title.localizedCaseInsensitiveContains("message") ? "message.fill" : "phone.fill")
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 40, height: 40)
+                    .background(Circle().fill(Color.accentColor))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                    if !subtitle.isEmpty {
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Text(message)
+                        .font(.subheadline)
+                        .foregroundStyle(.primary)
+                        .lineLimit(primaryActionTitle == nil ? 2 : 1)
                 }
-                Text(message)
-                    .font(.subheadline)
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 0)
+
+            if primaryActionTitle != nil || secondaryActionTitle != nil {
+                HStack(spacing: 12) {
+                    if let primaryActionTitle, let primaryAction {
+                        Button(primaryActionTitle, action: primaryAction)
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.large)
+                            .font(.headline)
+                            .frame(width: 142, height: 40)
+                    }
+                    if let secondaryActionTitle, let secondaryAction {
+                        Button(role: .destructive, action: secondaryAction) {
+                            Text(secondaryActionTitle)
+                                .font(.headline)
+                                .frame(width: 142, height: 40)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.large)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.leading, 52)
+                .padding(.top, 2)
+            }
         }
-        .padding(14)
-        .frame(width: 390, height: 118, alignment: .topLeading)
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+        .padding(.bottom, primaryActionTitle == nil ? 10 : 4)
+        .frame(width: 390, height: height, alignment: .topLeading)
         .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Color.primary.opacity(0.10), lineWidth: 1))
+        .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .onTapGesture {
+            if primaryActionTitle == nil { onTap?() }
+        }
+    }
+}
+
+struct SmsMessageDetailView: View {
+    let message: SmsMessage
+    let onCall: () -> Void
+    let onReply: (_ text: String, _ done: @escaping (String) -> Void) -> Void
+    let onClose: () -> Void
+
+    @State private var replyText = ""
+    @State private var replyStatus = ""
+    @State private var isSending = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("SMS Message")
+                        .font(.title3.weight(.semibold))
+                    Text(message.address.isEmpty ? "Unknown sender" : message.address)
+                        .font(.headline)
+                    Text(formattedDate)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Close", action: onClose)
+                    .controlSize(.large)
+            }
+
+            ScrollView {
+                Text(message.body.isEmpty ? "(empty message)" : message.body)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(12)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+            .frame(minHeight: 120, maxHeight: 155)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Reply")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                TextEditor(text: $replyText)
+                    .font(.body)
+                    .frame(height: 86)
+                    .padding(6)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                if !replyStatus.isEmpty {
+                    Text(replyStatus)
+                        .font(.caption)
+                        .foregroundStyle(replyStatus == "Sent" ? .green : .secondary)
+                        .lineLimit(2)
+                }
+            }
+
+            HStack(spacing: 12) {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(message.body, forType: .string)
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                        .frame(minWidth: 88)
+                }
+                .controlSize(.large)
+
+                Button { onCall() } label: {
+                    Label("Call", systemImage: "phone.fill")
+                        .frame(minWidth: 88)
+                }
+                .controlSize(.large)
+                .disabled(message.address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                Spacer(minLength: 0)
+
+                Button {
+                    let text = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !text.isEmpty else {
+                        replyStatus = "Type a reply first."
+                        return
+                    }
+                    isSending = true
+                    replyStatus = "Sending…"
+                    onReply(text) { status in
+                        replyStatus = status
+                        isSending = false
+                        if status == "Sent" { replyText = "" }
+                    }
+                } label: {
+                    Label(isSending ? "Sending" : "Send reply", systemImage: "paperplane.fill")
+                        .frame(minWidth: 128)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .disabled(isSending || replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(.top, 0)
+        }
+        .padding(.top, 16)
+        .padding(.horizontal, 18)
+        .padding(.bottom, 8)
+        .frame(width: 520, height: 470)
+    }
+
+    private var formattedDate: String {
+        let date = Date(timeIntervalSince1970: TimeInterval(message.date) / 1000)
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
     }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSUserNotificationCenterDelegate {
+    static func configureNotificationCategories() {
+        let answer = UNNotificationAction(identifier: OpenCallNotificationAction.answer,
+                                          title: "Answer",
+                                          options: [.foreground])
+        let decline = UNNotificationAction(identifier: OpenCallNotificationAction.decline,
+                                           title: "Decline",
+                                           options: [.destructive])
+        let incoming = UNNotificationCategory(identifier: OpenCallNotificationCategory.incomingCall,
+                                              actions: [answer, decline],
+                                              intentIdentifiers: [],
+                                              options: [.customDismissAction])
+        let sms = UNNotificationCategory(identifier: OpenCallNotificationCategory.sms,
+                                         actions: [],
+                                         intentIdentifiers: [],
+                                         options: [.customDismissAction])
+        UNUserNotificationCenter.current().setNotificationCategories([incoming, sms])
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        Self.configureNotificationCategories()
         UNUserNotificationCenter.current().delegate = self
         NSUserNotificationCenter.default.delegate = self
     }
@@ -826,8 +1298,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         completionHandler([.banner, .sound, .list])
     }
 
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let action = response.actionIdentifier
+        let info = response.notification.request.content.userInfo
+        Task { @MainActor in
+            AppModel.shared?.handleNotificationResponse(actionIdentifier: action, userInfo: info)
+            completionHandler()
+        }
+    }
+
     func userNotificationCenter(_ center: NSUserNotificationCenter, shouldPresent notification: NSUserNotification) -> Bool {
         true
+    }
+
+    func userNotificationCenter(_ center: NSUserNotificationCenter, didActivate notification: NSUserNotification) {
+        Task { @MainActor in
+            AppModel.shared?.handleLegacyNotificationActivation(notification)
+        }
     }
 }
 
