@@ -99,6 +99,11 @@ public class MainActivity extends Activity {
         reset.setOnClickListener(v -> { server.resetToken(); refreshStatus(); });
         root.addView(reset);
 
+        Button notificationAccess = new Button(this);
+        notificationAccess.setText("Instagram/Viber/Messenger notification access");
+        notificationAccess.setOnClickListener(v -> openNotificationListenerSettings());
+        root.addView(notificationAccess);
+
         Button battery = new Button(this);
         battery.setText("Battery optimization settings");
         battery.setOnClickListener(v -> openBatterySettings());
@@ -158,6 +163,9 @@ public class MainActivity extends Activity {
             appendPerm(sb, "Bluetooth advertise", Manifest.permission.BLUETOOTH_ADVERTISE);
         }
         if (Build.VERSION.SDK_INT >= 33) appendPerm(sb, "Notifications", Manifest.permission.POST_NOTIFICATIONS);
+        sb.append("- Instagram/Viber/Messenger notification access: ")
+                .append(AppNotificationStore.isNotificationListenerEnabled(this) ? "enabled" : "missing")
+                .append("\n");
         boolean classic = OpenCallCompanionService.bluetoothMetaServer(this).isRunning();
         boolean ble = OpenCallCompanionService.bleMetaServer(this).isRunning();
         sb.append("\nClassic Bluetooth discovery: ").append(classic ? "running" : "not running / permission needed").append("\n");
@@ -166,7 +174,7 @@ public class MainActivity extends Activity {
         if (bleError != null) sb.append(" (").append(bleError).append(")");
         sb.append("\nUUID: ").append(BluetoothMetaServer.SERVICE_UUID).append("\n");
         sb.append("BLE characteristic: ").append(BleMetaServer.CHARACTERISTIC_UUID).append("\n");
-        sb.append("\nEndpoints:\n/health\n/call-state?token=TOKEN\n/contacts?token=TOKEN\n/calls?token=TOKEN\n/sms?token=TOKEN\nPOST /dial?token=TOKEN {\"number\":\"...\"}\nPOST /send-sms?token=TOKEN {\"number\":\"...\",\"text\":\"...\"}\n");
+        sb.append("\nEndpoints:\n/health\n/call-state?token=TOKEN\n/contacts?token=TOKEN\n/calls?token=TOKEN\n/sms?token=TOKEN\n/notifications?token=TOKEN\nPOST /dial?token=TOKEN {\"number\":\"...\"}\nPOST /send-sms?token=TOKEN {\"number\":\"...\",\"text\":\"...\"}\n");
         status.setText(sb.toString());
     }
 
@@ -174,6 +182,14 @@ public class MainActivity extends Activity {
         sb.append("- ").append(label).append(": ")
                 .append(checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED ? "granted" : "missing")
                 .append("\n");
+    }
+
+    private void openNotificationListenerSettings() {
+        try {
+            startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
+        } catch (Exception e) {
+            Toast.makeText(this, "Open Android Settings > Notifications > Device & app notifications", Toast.LENGTH_LONG).show();
+        }
     }
 
     private void openBatterySettings() {

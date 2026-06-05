@@ -117,6 +117,7 @@ final class LocalHttpServer {
                 else if ("/call-state".equals(path) || "/callstate".equals(path)) respond(out, 200, provider.callState());
                 else if ("/calls".equals(path) || "/recents".equals(path)) respond(out, 200, provider.calls(limit));
                 else if ("/sms".equals(path) || "/messages".equals(path)) respond(out, 200, provider.sms(limit));
+                else if ("/notifications".equals(path) || "/app-notifications".equals(path)) respond(out, 200, provider.appNotifications(limit));
                 else if ("/dial".equals(path) || "/calls/dial".equals(path)) {
                     if (!"POST".equals(method)) { respond(out, 405, error("method_not_allowed")); return; }
                     JSONObject input = body == null || body.trim().isEmpty() ? new JSONObject() : new JSONObject(body);

@@ -214,10 +214,14 @@ final class DataProvider {
         return OpenCallCompanionService.callStateTracker(context).snapshot();
     }
 
+    JSONObject appNotifications(int limit) throws Exception {
+        return AppNotificationStore.list(context, limit);
+    }
+
     JSONObject health(String token, boolean running, int port, boolean bluetoothRunning, boolean bleRunning, String bleError) throws Exception {
         JSONObject out = ok();
         out.put("service", "OpenCall Companion");
-        out.put("version", 13);
+        out.put("version", 14);
         out.put("running", running);
         out.put("port", port);
         out.put("bluetoothRunning", bluetoothRunning || bleRunning);
@@ -228,6 +232,8 @@ final class DataProvider {
         out.put("bleError", bleError == null ? JSONObject.NULL : bleError);
         out.put("bluetoothUuid", BluetoothMetaServer.SERVICE_UUID.toString());
         out.put("bleCharacteristicUuid", BleMetaServer.CHARACTERISTIC_UUID.toString());
+        out.put("notificationListenerEnabled", AppNotificationStore.isNotificationListenerEnabled(context));
+        out.put("notificationPackages", AppNotificationStore.watchedPackages());
         out.put("tokenLength", token == null ? 0 : token.length());
         JSONArray missing = new JSONArray();
         if (!hasPermission(Manifest.permission.READ_CONTACTS)) missing.put("READ_CONTACTS");
@@ -237,6 +243,7 @@ final class DataProvider {
         if (!hasPermission(Manifest.permission.ANSWER_PHONE_CALLS)) missing.put("ANSWER_PHONE_CALLS");
         if (!hasPermission(Manifest.permission.READ_CALL_LOG)) missing.put("READ_CALL_LOG");
         if (!hasPermission(Manifest.permission.READ_PHONE_STATE)) missing.put("READ_PHONE_STATE");
+        if (!AppNotificationStore.isNotificationListenerEnabled(context)) missing.put("NOTIFICATION_LISTENER_ACCESS");
         if (android.os.Build.VERSION.SDK_INT >= 31 && !hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) missing.put("BLUETOOTH_CONNECT");
         if (android.os.Build.VERSION.SDK_INT >= 31 && !hasPermission(Manifest.permission.BLUETOOTH_ADVERTISE)) missing.put("BLUETOOTH_ADVERTISE");
         out.put("missingPermissions", missing);

@@ -488,6 +488,8 @@ struct HealthResponse: Decodable {    let ok: Bool
     let port: Int?
     let bluetoothRunning: Bool?
     let bluetoothUuid: String?
+    let notificationListenerEnabled: Bool?
+    let notificationPackages: [String]?
     let missingPermissions: [String]?
     let error: String?
 }
@@ -533,6 +535,15 @@ struct SmsResponse: Decodable {
     let ok: Bool
     let messages: [SmsMessage]?
     let count: Int?
+    let error: String?
+}
+
+struct AppNotificationsResponse: Decodable {
+    let ok: Bool
+    let notifications: [ExternalAppNotification]?
+    let count: Int?
+    let listenerEnabled: Bool?
+    let watchedPackages: [String]?
     let error: String?
 }
 
@@ -589,12 +600,26 @@ struct SmsMessage: Codable, Identifiable, Hashable {
     let read: Bool
 }
 
+struct ExternalAppNotification: Codable, Identifiable, Hashable {
+    let id: String
+    let key: String?
+    let packageName: String
+    let appName: String
+    let title: String
+    let text: String
+    let subText: String?
+    let date: Int64
+    let clearable: Bool?
+    let group: String?
+}
+
 enum OpenCallNotificationKind: String {
     case generic
     case incomingCall
     case activeCall
     case sms
     case smsSummary
+    case externalApp
 }
 
 enum OpenCallNotificationCategory {
@@ -657,6 +682,8 @@ final class AppModel: NSObject, ObservableObject {
     private static let contactsCacheKey = "cachedContacts"
     private static let recentCallsCacheKey = "cachedRecentCalls"
     private static let messagesCacheKey = "cachedSmsMessages"
+    private static let appNotificationsEnabledKey = "appNotificationsEnabled"
+    private static let lastSeenAppNotificationDateKey = "lastSeenAppNotificationDate"
     private static let activeCallPollPausedUntilKey = "activeCallPollPausedUntil"
     private static let activeCallPollPauseSeconds: TimeInterval = 90 * 60
     private static let companionFailuresBeforeHfpFallback = 3
@@ -697,12 +724,25 @@ final class AppModel: NSObject, ObservableObject {
             monitoringEnabled ? startMonitoring() : stopMonitoring()
         }
     }
+    @Published var appNotificationsEnabled = UserDefaults.standard.object(forKey: AppModel.appNotificationsEnabledKey) as? Bool ?? false {
+        didSet {
+            UserDefaults.standard.set(appNotificationsEnabled, forKey: AppModel.appNotificationsEnabledKey)
+            if appNotificationsEnabled {
+                lastAppNotificationPoll = Date.distantPast
+                monitorStatus = "Instagram/Viber/Messenger monitor enabled. Grant Android notification access if needed."
+                pollExternalAppNotificationsForNotifications()
+            } else {
+                monitorStatus = "Instagram/Viber/Messenger monitor disabled."
+            }
+        }
+    }
     @Published var monitorStatus = "Resident monitor ready."
 
     private var monitorTimer: Timer?
     private var isPollingCall = false
     private var isPollingCompanionCallState = false
     private var isPollingMessages = false
+    private var isPollingAppNotifications = false
     private var incomingCallNotified = false
     private var activeCallNotified = false
     private var lastIncomingNotificationAt = Date.distantPast
@@ -711,7 +751,10 @@ final class AppModel: NSObject, ObservableObject {
     private var activeCallPollMinimumResumeAt = Date.distantPast
     private var lastSeenMessageDate = UserDefaults.standard.object(forKey: "lastSeenMessageDate") as? Int64 ?? 0
     private var messageBaselinePrimed = UserDefaults.standard.object(forKey: "lastSeenMessageDate") != nil
+    private var lastSeenAppNotificationDate = UserDefaults.standard.object(forKey: AppModel.lastSeenAppNotificationDateKey) as? Int64 ?? 0
+    private var appNotificationBaselinePrimed = UserDefaults.standard.object(forKey: AppModel.lastSeenAppNotificationDateKey) != nil
     private var lastMessagePoll = Date.distantPast
+    private var lastAppNotificationPoll = Date.distantPast
     private var notificationPanels: [NSPanel] = []
     private var messagePanels: [NSPanel] = []
     private var bleDiscoverer: CompanionBLEDiscoverer?
@@ -752,6 +795,9 @@ final class AppModel: NSObject, ObservableObject {
         refreshLog()
         if !contacts.isEmpty || !recentCalls.isEmpty || !messages.isEmpty {
             syncStatus = "Loaded cached sync: \(contacts.count) contacts, \(recentCalls.count) recents, \(messages.count) SMS."
+        }
+        if appNotificationsEnabled {
+            monitorStatus = "Instagram/Viber/Messenger monitor enabled; waiting for companion notifications."
         }
         if monitoringEnabled { startMonitoring() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.autoConnectSelectedPhone() }
@@ -926,6 +972,10 @@ final class AppModel: NSObject, ObservableObject {
         monitorStatus = enabled ? "Resident monitor enabled." : "Resident monitor disabled."
     }
 
+    func setAppNotificationsEnabled(_ enabled: Bool) {
+        appNotificationsEnabled = enabled
+    }
+
     func requestNotificationAccess() {
         AppDelegate.configureNotificationCategories()
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
@@ -1033,6 +1083,10 @@ final class AppModel: NSObject, ObservableObject {
         if Date().timeIntervalSince(lastMessagePoll) >= 18 {
             lastMessagePoll = Date()
             pollMessagesForNotifications()
+        }
+        if appNotificationsEnabled && Date().timeIntervalSince(lastAppNotificationPoll) >= 10 {
+            lastAppNotificationPoll = Date()
+            pollExternalAppNotificationsForNotifications()
         }
     }
 
@@ -1219,6 +1273,65 @@ final class AppModel: NSObject, ObservableObject {
                 self.monitorStatus = "Message monitor failed: \(error.message)"
             }
         }
+    }
+
+    private func pollExternalAppNotificationsForNotifications() {
+        guard appNotificationsEnabled, !isPollingAppNotifications else { return }
+        guard companionCallStateAvailable else { return }
+        isPollingAppNotifications = true
+        fetch("notifications", as: AppNotificationsResponse.self, limit: 40) { result in
+            self.isPollingAppNotifications = false
+            switch result {
+            case .success(let response) where response.ok:
+                guard response.listenerEnabled != false else {
+                    self.monitorStatus = "Instagram/Viber/Messenger monitor needs Android Notification Access."
+                    return
+                }
+                let fetched = response.notifications ?? []
+                let newest = fetched.map(\.date).max() ?? self.lastSeenAppNotificationDate
+                if !self.appNotificationBaselinePrimed {
+                    self.appNotificationBaselinePrimed = true
+                    self.lastSeenAppNotificationDate = max(self.lastSeenAppNotificationDate, newest)
+                    UserDefaults.standard.set(self.lastSeenAppNotificationDate, forKey: Self.lastSeenAppNotificationDateKey)
+                    if response.listenerEnabled == true {
+                        self.monitorStatus = "Instagram/Viber/Messenger monitor ready."
+                    }
+                    return
+                }
+                let newItems = fetched
+                    .filter { $0.date > self.lastSeenAppNotificationDate }
+                    .sorted { $0.date < $1.date }
+                for item in newItems.prefix(5) {
+                    self.postExternalAppNotification(item)
+                }
+                if newest > self.lastSeenAppNotificationDate {
+                    self.lastSeenAppNotificationDate = newest
+                    UserDefaults.standard.set(newest, forKey: Self.lastSeenAppNotificationDateKey)
+                }
+                if !newItems.isEmpty {
+                    self.monitorStatus = "Displayed \(min(newItems.count, 5)) Instagram/Viber/Messenger notification(s)."
+                }
+            case .success(let response):
+                self.monitorStatus = "Instagram/Viber/Messenger monitor failed: \(response.error ?? "unknown error")"
+            case .failure(let error):
+                self.monitorStatus = "Instagram/Viber/Messenger monitor failed: \(error.message)"
+            }
+        }
+    }
+
+    private func postExternalAppNotification(_ item: ExternalAppNotification) {
+        let appName = item.appName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? item.packageName : item.appName
+        let sender = item.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let subText = item.subText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let bodySource = !text.isEmpty ? text : (!subText.isEmpty ? subText : "New \(appName) notification.")
+        let subtitle = sender.isEmpty ? item.packageName : sender
+        appendAppLog("External app notification detected: app=\(appName) id=\(Self.stableIdentifierSuffix(item.id))")
+        postNotification(title: appName,
+                         subtitle: subtitle,
+                         body: notificationSnippet(bodySource),
+                         identifier: "opencall.external.\(Self.stableIdentifierSuffix(item.id))",
+                         kind: .externalApp)
     }
 
     private func notificationSnippet(_ text: String) -> String {
@@ -2037,6 +2150,14 @@ final class AppModel: NSObject, ObservableObject {
             .joined(separator: "\n")
     }
 
+    nonisolated static func stableIdentifierSuffix(_ text: String) -> String {
+        var hash: UInt64 = 1469598103934665603
+        for byte in text.utf8 {
+            hash = (hash ^ UInt64(byte)) &* 1099511628211
+        }
+        return String(hash, radix: 16)
+    }
+
     nonisolated static func runHelper(path: String, command: String, address: String, logPath: String, number: String? = nil) -> CommandResult {
         let task = Process()
         let stdout = Pipe()
@@ -2360,6 +2481,7 @@ struct MenuBarView: View {
         Button("Test Notification") { model.sendTestNotification() }
         Divider()
         Toggle("Monitor calls/messages", isOn: Binding(get: { model.monitoringEnabled }, set: { model.setMonitoringEnabled($0) }))
+        Toggle("Instagram/Viber/Messenger alerts", isOn: Binding(get: { model.appNotificationsEnabled }, set: { model.setAppNotificationsEnabled($0) }))
         Toggle("Launch at Login", isOn: Binding(get: { model.launchAtLoginEnabled }, set: { model.setLaunchAtLogin($0) }))
         Divider()
         Button("Quit OpenCall") { NSApp.terminate(nil) }
@@ -2454,6 +2576,7 @@ struct ContentView: View {
             HStack(spacing: 14) {
                 Toggle("Launch at login", isOn: Binding(get: { model.launchAtLoginEnabled }, set: { model.setLaunchAtLogin($0) }))
                 Toggle("Monitor calls/messages", isOn: Binding(get: { model.monitoringEnabled }, set: { model.setMonitoringEnabled($0) }))
+                Toggle("Instagram/Viber/Messenger alerts", isOn: Binding(get: { model.appNotificationsEnabled }, set: { model.setAppNotificationsEnabled($0) }))
                 Button("Check phone now") { model.autoConnectSelectedPhone() }
                     .disabled(model.busy)
                 Button("Resume fallback monitor") { model.resumeAutomaticCallPollingNow() }
