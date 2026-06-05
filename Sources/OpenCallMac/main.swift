@@ -551,6 +551,14 @@ struct DialResponse: Decodable {
     let error: String?
 }
 
+struct CallControlResponse: Decodable {
+    let ok: Bool
+    let answerRequested: Bool?
+    let hangupRequested: Bool?
+    let ended: Bool?
+    let error: String?
+}
+
 struct PhoneContact: Codable, Identifiable, Hashable {
     let id: String
     let name: String
@@ -730,6 +738,12 @@ final class AppModel: NSObject, ObservableObject {
         devices.first(where: { $0.address.lowercased() == selectedAddress.lowercased() })?.displayName ?? selectedAddress
     }
 
+    private var isCompanionConfigured: Bool {
+        let base = companionURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = companionToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !base.isEmpty && base.contains("://") && !token.isEmpty
+    }
+
     override init() {
         super.init()
         Self.shared = self
@@ -802,6 +816,38 @@ final class AppModel: NSObject, ObservableObject {
                         return
                     }
                     self.runHfpHelper(command: command, helper: self.helperPath, address: self.selectedAddress, logPath: self.logPath, dialNumber: dialNumber)
+                }
+            }
+            return
+        }
+        if (command == "answer" || command == "hangup"), isCompanionConfigured {
+            if command == "answer" {
+                pauseAutomaticCallPollingForActiveCall(note: "after answering through companion")
+            }
+            busy = true
+            output = command == "answer" ? "Answering through Android companion…" : "Hanging up through Android companion…"
+            sendCompanionCallControl(command: command) { result in
+                switch result {
+                case .success(let message):
+                    self.busy = false
+                    self.output = message
+                    self.appendAppLog("\(command.capitalized) requested through Android companion")
+                    if command == "hangup" {
+                        self.resumeAutomaticCallPollingAfterCallEnded(logReason: "companion hangup")
+                    }
+                    self.pollCompanionCallStateForMonitor()
+                case .failure(let error):
+                    self.appendAppLog("Companion \(command) failed; falling back to native HFP: \(error.message)")
+                    self.output = "Companion \(command) failed; trying native HFP…"
+                    guard !self.selectedAddress.isEmpty else {
+                        self.busy = false
+                        self.output = "Companion \(command) failed and no Bluetooth phone is selected for HFP fallback."
+                        return
+                    }
+                    if command == "hangup" {
+                        self.resumeAutomaticCallPollingAfterCallEnded(logReason: "native HFP hangup fallback")
+                    }
+                    self.runHfpHelper(command: command, helper: self.helperPath, address: self.selectedAddress, logPath: self.logPath, dialNumber: nil)
                 }
             }
             return
@@ -1756,6 +1802,65 @@ final class AppModel: NSObject, ObservableObject {
             } catch {
                 let raw = String(data: data, encoding: .utf8) ?? ""
                 DispatchQueue.main.async { completion(.failure(SyncError(raw.isEmpty ? error.localizedDescription : raw))) }
+            }
+        }.resume()
+    }
+
+    func sendCompanionCallControl(command: String, completion: @escaping (Result<String, SyncError>) -> Void) {
+        let endpoint: String
+        switch command {
+        case "answer": endpoint = "answer"
+        case "hangup": endpoint = "hangup"
+        default:
+            completion(.failure(SyncError("Unsupported companion call-control command.")))
+            return
+        }
+        let base = companionURL.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !base.isEmpty, base.contains("://") else {
+            completion(.failure(SyncError("Enter companion URL first.")))
+            return
+        }
+        let token = companionToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            completion(.failure(SyncError("Enter companion token first.")))
+            return
+        }
+        var components = URLComponents(string: base + "/" + endpoint)
+        components?.queryItems = [URLQueryItem(name: "token", value: token)]
+        guard let url = components?.url else {
+            completion(.failure(SyncError("Bad companion URL.")))
+            return
+        }
+        var request = URLRequest(url: url, timeoutInterval: 8)
+        request.httpMethod = "POST"
+        request.setValue(token, forHTTPHeaderField: "X-OpenCall-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                DispatchQueue.main.async { completion(.failure(SyncError(error.localizedDescription))) }
+                return
+            }
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard let data else {
+                DispatchQueue.main.async { completion(.failure(SyncError("no response"))) }
+                return
+            }
+            do {
+                let decoded = try JSONDecoder().decode(CallControlResponse.self, from: data)
+                DispatchQueue.main.async {
+                    if decoded.ok && command == "answer" && decoded.answerRequested == true {
+                        completion(.success("Answer requested through Android companion."))
+                    } else if decoded.ok && command == "hangup" && decoded.hangupRequested == true {
+                        let message = decoded.ended == false ? "Hangup requested; Android reported no active call." : "Hangup requested through Android companion."
+                        completion(.success(message))
+                    } else {
+                        completion(.failure(SyncError(decoded.error ?? "unknown \(command) error")))
+                    }
+                }
+            } catch {
+                let raw = String(data: data, encoding: .utf8) ?? ""
+                let message = raw.isEmpty ? error.localizedDescription : raw
+                DispatchQueue.main.async { completion(.failure(SyncError(statusCode > 0 ? "HTTP \(statusCode): \(message)" : message))) }
             }
         }.resume()
     }

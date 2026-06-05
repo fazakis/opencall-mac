@@ -123,6 +123,14 @@ final class LocalHttpServer {
                     String number = input.optString("number", params.get("number"));
                     respond(out, 200, provider.dial(number));
                 }
+                else if ("/answer".equals(path) || "/calls/answer".equals(path)) {
+                    if (!"POST".equals(method)) { respond(out, 405, error("method_not_allowed")); return; }
+                    respond(out, 200, provider.answer());
+                }
+                else if ("/hangup".equals(path) || "/calls/hangup".equals(path)) {
+                    if (!"POST".equals(method)) { respond(out, 405, error("method_not_allowed")); return; }
+                    respond(out, 200, provider.hangup());
+                }
                 else if ("/send-sms".equals(path) || "/sms/send".equals(path)) {
                     if (!"POST".equals(method)) { respond(out, 405, error("method_not_allowed")); return; }
                     JSONObject input = body == null || body.trim().isEmpty() ? new JSONObject() : new JSONObject(body);

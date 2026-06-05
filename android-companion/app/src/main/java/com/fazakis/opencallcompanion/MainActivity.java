@@ -123,6 +123,7 @@ public class MainActivity extends Activity {
         addIfMissing(needed, Manifest.permission.READ_SMS);
         addIfMissing(needed, Manifest.permission.SEND_SMS);
         addIfMissing(needed, Manifest.permission.CALL_PHONE);
+        addIfMissing(needed, Manifest.permission.ANSWER_PHONE_CALLS);
         addIfMissing(needed, Manifest.permission.READ_CALL_LOG);
         addIfMissing(needed, Manifest.permission.READ_PHONE_STATE);
         if (Build.VERSION.SDK_INT >= 31) {
@@ -149,6 +150,7 @@ public class MainActivity extends Activity {
         appendPerm(sb, "SMS read", Manifest.permission.READ_SMS);
         appendPerm(sb, "SMS send", Manifest.permission.SEND_SMS);
         appendPerm(sb, "Phone dial", Manifest.permission.CALL_PHONE);
+        appendPerm(sb, "Phone answer/hangup", Manifest.permission.ANSWER_PHONE_CALLS);
         appendPerm(sb, "Call log", Manifest.permission.READ_CALL_LOG);
         appendPerm(sb, "Phone state", Manifest.permission.READ_PHONE_STATE);
         if (Build.VERSION.SDK_INT >= 31) {

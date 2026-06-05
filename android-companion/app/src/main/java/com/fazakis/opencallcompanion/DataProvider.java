@@ -167,6 +167,27 @@ final class DataProvider {
         return out;
     }
 
+    JSONObject answer() throws Exception {
+        require(Manifest.permission.ANSWER_PHONE_CALLS);
+        TelecomManager telecom = context.getSystemService(TelecomManager.class);
+        if (telecom == null) throw new IllegalStateException("TelecomManager unavailable");
+        telecom.acceptRingingCall();
+        JSONObject out = ok();
+        out.put("answerRequested", true);
+        return out;
+    }
+
+    JSONObject hangup() throws Exception {
+        require(Manifest.permission.ANSWER_PHONE_CALLS);
+        TelecomManager telecom = context.getSystemService(TelecomManager.class);
+        if (telecom == null) throw new IllegalStateException("TelecomManager unavailable");
+        boolean ended = telecom.endCall();
+        JSONObject out = ok();
+        out.put("hangupRequested", true);
+        out.put("ended", ended);
+        return out;
+    }
+
     JSONObject sendSms(String number, String text) throws Exception {
         require(Manifest.permission.SEND_SMS);
         String cleanNumber = number == null ? "" : number.trim();
@@ -196,7 +217,7 @@ final class DataProvider {
     JSONObject health(String token, boolean running, int port, boolean bluetoothRunning, boolean bleRunning, String bleError) throws Exception {
         JSONObject out = ok();
         out.put("service", "OpenCall Companion");
-        out.put("version", 10);
+        out.put("version", 13);
         out.put("running", running);
         out.put("port", port);
         out.put("bluetoothRunning", bluetoothRunning || bleRunning);
@@ -213,6 +234,7 @@ final class DataProvider {
         if (!hasPermission(Manifest.permission.READ_SMS)) missing.put("READ_SMS");
         if (!hasPermission(Manifest.permission.SEND_SMS)) missing.put("SEND_SMS");
         if (!hasPermission(Manifest.permission.CALL_PHONE)) missing.put("CALL_PHONE");
+        if (!hasPermission(Manifest.permission.ANSWER_PHONE_CALLS)) missing.put("ANSWER_PHONE_CALLS");
         if (!hasPermission(Manifest.permission.READ_CALL_LOG)) missing.put("READ_CALL_LOG");
         if (!hasPermission(Manifest.permission.READ_PHONE_STATE)) missing.put("READ_PHONE_STATE");
         if (android.os.Build.VERSION.SDK_INT >= 31 && !hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) missing.put("BLUETOOTH_CONNECT");
