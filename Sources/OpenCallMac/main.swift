@@ -1424,17 +1424,35 @@ final class AppModel: NSObject, ObservableObject {
         notificationPanels.removeAll { $0 === panel }
     }
 
-    private func showMainWindow() {
-        NSApp.activate(ignoringOtherApps: true)
-        if let window = NSApp.windows.first(where: { $0.title == "OpenCall Mac" || $0.canBecomeKey }) {
-            window.makeKeyAndOrderFront(nil)
+    @discardableResult
+    func focusMainWindowIfOpen() -> Bool {
+        NSApp.unhide(nil)
+        let mainWindows = NSApp.windows.filter { window in
+            !(window is NSPanel) && window.title == "OpenCall Mac"
         }
+        let window = mainWindows.first ?? NSApp.windows.first { window in
+            !(window is NSPanel) && window.canBecomeKey && window.isVisible
+        }
+        guard let window else { return false }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        return true
+    }
+
+    private func showMainWindow() {
+        _ = focusMainWindowIfOpen()
+    }
+
+    func openSmsMessageForReply(_ message: SmsMessage) {
+        appendAppLog("Opening SMS message for reply: id=\(message.id)")
+        showMainWindow()
+        showSmsMessageWindow(message)
     }
 
     private func openSmsMessage(_ message: SmsMessage) {
         appendAppLog("Opening SMS notification: id=\(message.id)")
-        showMainWindow()
-        showSmsMessageWindow(message)
+        openSmsMessageForReply(message)
     }
 
     private func showSmsMessageWindow(_ message: SmsMessage) {
@@ -2296,7 +2314,7 @@ struct OpenCallMacApp: App {
     @StateObject private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup("OpenCall Mac", id: "main") {
+        Window("OpenCall Mac", id: "main") {
             ContentView(model: model).frame(width: 900, height: 830)
         }
         .windowResizability(.contentSize)
@@ -2324,8 +2342,12 @@ struct MenuBarView: View {
 
     var body: some View {
         Button("Show OpenCall") {
-            openWindow(id: "main")
-            NSApp.activate(ignoringOtherApps: true)
+            if !model.focusMainWindowIfOpen() {
+                openWindow(id: "main")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    _ = model.focusMainWindowIfOpen()
+                }
+            }
         }
         Divider()
         Text(model.selectedDeviceName.isEmpty ? "No phone selected" : model.selectedDeviceName)
@@ -2523,6 +2545,7 @@ struct ContentView: View {
                     Text(message.type).font(.caption).foregroundStyle(.secondary)
                     Spacer()
                     Text(formatMillis(message.date)).font(.caption).foregroundStyle(.secondary)
+                    Button("Reply") { model.openSmsMessageForReply(message) }
                     Button("Call") { model.call(message.address) }
                 }
                 Text(message.body).lineLimit(3).textSelection(.enabled)
