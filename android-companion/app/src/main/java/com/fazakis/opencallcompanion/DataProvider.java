@@ -196,7 +196,7 @@ final class DataProvider {
     JSONObject health(String token, boolean running, int port, boolean bluetoothRunning, boolean bleRunning, String bleError) throws Exception {
         JSONObject out = ok();
         out.put("service", "OpenCall Companion");
-        out.put("version", 6);
+        out.put("version", 10);
         out.put("running", running);
         out.put("port", port);
         out.put("bluetoothRunning", bluetoothRunning || bleRunning);

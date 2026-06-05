@@ -57,7 +57,7 @@ final class BluetoothMetaServer {
     private void loop() {
         BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
         if (adapter == null) { running = false; return; }
-        try (BluetoothServerSocket ss = adapter.listenUsingInsecureRfcommWithServiceRecord(SERVICE_NAME, SERVICE_UUID)) {
+        try (BluetoothServerSocket ss = adapter.listenUsingRfcommWithServiceRecord(SERVICE_NAME, SERVICE_UUID)) {
             serverSocket = ss;
             while (running) {
                 BluetoothSocket socket = ss.accept();
@@ -75,8 +75,8 @@ final class BluetoothMetaServer {
             JSONObject obj = new JSONObject();
             obj.put("ok", true);
             obj.put("service", "OpenCall Companion");
-            obj.put("version", 6);
-            obj.put("transport", "classic-rfcomm-insecure");
+            obj.put("version", 10);
+            obj.put("transport", "classic-rfcomm-secure");
             obj.put("url", httpServer.localUrl());
             obj.put("port", LocalHttpServer.PORT);
             obj.put("token", httpServer.token());

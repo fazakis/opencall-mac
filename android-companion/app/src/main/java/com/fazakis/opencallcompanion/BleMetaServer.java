@@ -27,11 +27,14 @@ import java.util.UUID;
 final class BleMetaServer {
     static final UUID SERVICE_UUID = UUID.fromString("9fb61f76-4a9d-4f97-a6be-2a97f6f7f2b1");
     static final UUID CHARACTERISTIC_UUID = UUID.fromString("9fb61f77-4a9d-4f97-a6be-2a97f6f7f2b1");
+    static final UUID ENDPOINT_CHARACTERISTIC_UUID = UUID.fromString("9fb61f78-4a9d-4f97-a6be-2a97f6f7f2b1");
+    static final UUID TOKEN_CHARACTERISTIC_UUID = UUID.fromString("9fb61f79-4a9d-4f97-a6be-2a97f6f7f2b1");
+    private static final int MANUFACTURER_ID = 0xF105;
 
-    private static final long STARTUP_BOOST_MS = 2 * 60 * 1000L;
-    private static final long RECENT_MAC_WINDOW_MS = 5 * 60 * 1000L;
-    private static final long REDISCOVERY_AFTER_MS = 15 * 60 * 1000L;
-    private static final long REDISCOVERY_BOOST_MS = 60 * 1000L;
+    private static final long STARTUP_BOOST_MS = 5 * 60 * 1000L;
+    private static final long RECENT_MAC_WINDOW_MS = 30 * 1000L;
+    private static final long REDISCOVERY_AFTER_MS = 2 * 60 * 1000L;
+    private static final long REDISCOVERY_BOOST_MS = 2 * 60 * 1000L;
     private static final long MODE_CHECK_MS = 30 * 1000L;
 
     private final Context context;
@@ -39,6 +42,8 @@ final class BleMetaServer {
     private BluetoothGattServer gattServer;
     private BluetoothLeAdvertiser advertiser;
     private BluetoothGattCharacteristic characteristic;
+    private BluetoothGattCharacteristic endpointCharacteristic;
+    private BluetoothGattCharacteristic tokenCharacteristic;
     private Thread modeThread;
     private volatile boolean running = false;
     private volatile boolean advertising = false;
@@ -71,7 +76,17 @@ final class BleMetaServer {
                     CHARACTERISTIC_UUID,
                     BluetoothGattCharacteristic.PROPERTY_READ,
                     BluetoothGattCharacteristic.PERMISSION_READ);
+            endpointCharacteristic = new BluetoothGattCharacteristic(
+                    ENDPOINT_CHARACTERISTIC_UUID,
+                    BluetoothGattCharacteristic.PROPERTY_READ,
+                    BluetoothGattCharacteristic.PERMISSION_READ);
+            tokenCharacteristic = new BluetoothGattCharacteristic(
+                    TOKEN_CHARACTERISTIC_UUID,
+                    BluetoothGattCharacteristic.PROPERTY_READ,
+                    BluetoothGattCharacteristic.PERMISSION_READ);
             service.addCharacteristic(characteristic);
+            service.addCharacteristic(endpointCharacteristic);
+            service.addCharacteristic(tokenCharacteristic);
             gattServer.addService(service);
 
             running = true;
@@ -155,7 +170,7 @@ final class BleMetaServer {
         }
         boolean boosted = !recentlySeen && boostUntil > now;
         int desiredMode = boosted ? AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY : AdvertiseSettings.ADVERTISE_MODE_LOW_POWER;
-        int desiredPower = boosted ? AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM : AdvertiseSettings.ADVERTISE_TX_POWER_LOW;
+        int desiredPower = boosted ? AdvertiseSettings.ADVERTISE_TX_POWER_HIGH : AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM;
         startAdvertisingLocked(desiredMode, desiredPower);
     }
 
@@ -169,7 +184,7 @@ final class BleMetaServer {
                 .setTxPowerLevel(power)
                 .build();
         AdvertiseData data = new AdvertiseData.Builder()
-                .addServiceUuid(new ParcelUuid(SERVICE_UUID))
+                .addManufacturerData(MANUFACTURER_ID, advertisementPayload())
                 .setIncludeDeviceName(false)
                 .build();
         try {
@@ -196,13 +211,15 @@ final class BleMetaServer {
             JSONObject obj = new JSONObject();
             obj.put("ok", true);
             obj.put("service", "OpenCall Companion");
-            obj.put("version", 6);
+            obj.put("version", 10);
             obj.put("transport", "ble-gatt");
             obj.put("url", httpServer.localUrl());
             obj.put("port", LocalHttpServer.PORT);
             obj.put("token", httpServer.token());
             obj.put("bluetoothUuid", SERVICE_UUID.toString());
             obj.put("characteristicUuid", CHARACTERISTIC_UUID.toString());
+            obj.put("endpointCharacteristicUuid", ENDPOINT_CHARACTERISTIC_UUID.toString());
+            obj.put("tokenCharacteristicUuid", TOKEN_CHARACTERISTIC_UUID.toString());
             obj.put("advertiseMode", advertiseModeName());
             return (obj.toString() + "\n").getBytes(StandardCharsets.UTF_8);
         } catch (Exception e) {
@@ -210,13 +227,53 @@ final class BleMetaServer {
         }
     }
 
+
+    private byte[] endpointBytes() {
+        String endpoint = httpServer.localUrl()
+                .replace("http://", "")
+                .replace("https://", "");
+        return endpoint.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private byte[] tokenBytes() {
+        return httpServer.token().getBytes(StandardCharsets.UTF_8);
+    }
+
+
+    private byte[] advertisementPayload() {
+        byte[] token = httpServer.token().getBytes(StandardCharsets.UTF_8);
+        byte[] out = new byte[1 + 4 + token.length];
+        out[0] = 10;
+        String endpoint = httpServer.localUrl()
+                .replace("http://", "")
+                .replace("https://", "");
+        String host = endpoint;
+        int colon = endpoint.indexOf(':');
+        if (colon >= 0) host = endpoint.substring(0, colon);
+        String[] parts = host.split("\\.");
+        for (int i = 0; i < 4; i++) {
+            int value = 0;
+            try { if (i < parts.length) value = Integer.parseInt(parts[i]); } catch (Exception ignored) {}
+            out[1 + i] = (byte) (value & 0xff);
+        }
+        System.arraycopy(token, 0, out, 5, token.length);
+        return out;
+    }
+
     private final BluetoothGattServerCallback callback = new BluetoothGattServerCallback() {
         @Override public void onCharacteristicReadRequest(BluetoothDevice device, int requestId, int offset, BluetoothGattCharacteristic ch) {
-            if (!CHARACTERISTIC_UUID.equals(ch.getUuid())) {
+            UUID uuid = ch.getUuid();
+            byte[] bytes;
+            if (CHARACTERISTIC_UUID.equals(uuid)) {
+                bytes = metadataBytes();
+            } else if (ENDPOINT_CHARACTERISTIC_UUID.equals(uuid)) {
+                bytes = endpointBytes();
+            } else if (TOKEN_CHARACTERISTIC_UUID.equals(uuid)) {
+                bytes = tokenBytes();
+            } else {
                 try { gattServer.sendResponse(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null); } catch (Exception ignored) {}
                 return;
             }
-            byte[] bytes = metadataBytes();
             if (offset < 0 || offset > bytes.length) {
                 try { gattServer.sendResponse(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null); } catch (Exception ignored) {}
                 return;

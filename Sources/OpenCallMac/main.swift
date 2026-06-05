@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import IOBluetooth
+import CoreBluetooth
 import Foundation
 import UserNotifications
 
@@ -29,8 +30,459 @@ struct SyncError: Error, CustomStringConvertible, LocalizedError {
     var errorDescription: String? { message }
 }
 
-struct HealthResponse: Decodable {
-    let ok: Bool
+
+private let companionBluetoothServiceUUIDString = "9fb61f76-4a9d-4f97-a6be-2a97f6f7f2b1"
+private let companionBluetoothCharacteristicUUIDString = "9fb61f77-4a9d-4f97-a6be-2a97f6f7f2b1"
+private let companionBluetoothEndpointCharacteristicUUIDString = "9fb61f78-4a9d-4f97-a6be-2a97f6f7f2b1"
+private let companionBluetoothTokenCharacteristicUUIDString = "9fb61f79-4a9d-4f97-a6be-2a97f6f7f2b1"
+private let companionBluetoothManufacturerID: UInt16 = 0xF105
+
+final class CompanionBLEDiscoverer: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+    private let serviceUUID = CBUUID(string: companionBluetoothServiceUUIDString)
+    private let characteristicUUID = CBUUID(string: companionBluetoothCharacteristicUUIDString)
+    private let endpointCharacteristicUUID = CBUUID(string: companionBluetoothEndpointCharacteristicUUIDString)
+    private let tokenCharacteristicUUID = CBUUID(string: companionBluetoothTokenCharacteristicUUIDString)
+    private let queue = DispatchQueue(label: "local.opencall.mac.ble-discovery")
+    private let timeout: TimeInterval
+    private let completion: (Result<String, Error>) -> Void
+    private var central: CBCentralManager?
+    private var peripheral: CBPeripheral?
+    private var finished = false
+    private var discoveredAdvertisements = 0
+    private var probedAdvertisements = 0
+    private var probingUnadvertisedPeripheral = false
+    private var triedPeripheralIDs = Set<UUID>()
+    private var usingTargetedScan = false
+    private var advertisementSummaries: [String] = []
+    private var metadataCharacteristic: CBCharacteristic?
+    private var endpointCharacteristic: CBCharacteristic?
+    private var tokenCharacteristic: CBCharacteristic?
+    private var endpointText: String?
+    private var tokenText: String?
+
+    init(timeout: TimeInterval, completion: @escaping (Result<String, Error>) -> Void) {
+        self.timeout = timeout
+        self.completion = completion
+        super.init()
+    }
+
+    func start() {
+        central = CBCentralManager(delegate: self, queue: queue)
+        queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            guard let self else { return }
+            self.finish(.failure(SyncError("Timed out waiting for BLE OpenCall Companion metadata; saw \(self.discoveredAdvertisements) BLE advertisement(s), probed \(self.probedAdvertisements) peripheral(s)\(self.advertisementSummaries.isEmpty ? "" : "; advertisements: " + self.advertisementSummaries.joined(separator: " | "))")))
+        }
+    }
+
+    private func finish(_ value: Result<String, Error>) {
+        if finished { return }
+        finished = true
+        central?.stopScan()
+        if let peripheral { central?.cancelPeripheralConnection(peripheral) }
+        DispatchQueue.main.async { self.completion(value) }
+    }
+
+    private func metadataFromAdvertisement(_ advertisementData: [String: Any]) -> String? {
+        guard let data = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data else { return nil }
+        let bytes = [UInt8](data)
+        let payloadStart: Int
+        if bytes.count >= 2,
+           UInt16(bytes[0]) | (UInt16(bytes[1]) << 8) == companionBluetoothManufacturerID {
+            payloadStart = 2
+        } else if bytes.first == 9 {
+            // Some CoreBluetooth surfaces strip the company id; accept the raw payload too.
+            payloadStart = 0
+        } else {
+            return nil
+        }
+        guard bytes.count >= payloadStart + 1 + 4 + 1 else { return nil }
+        let version = bytes[payloadStart]
+        guard version >= 9 else { return nil }
+        let ipBytes = bytes[(payloadStart + 1)..<(payloadStart + 5)]
+        let port: UInt16
+        let tokenStart: Int
+        if version >= 10 {
+            port = 9096
+            tokenStart = payloadStart + 5
+        } else {
+            guard bytes.count >= payloadStart + 1 + 4 + 2 + 1 else { return nil }
+            let portHigh = UInt16(bytes[payloadStart + 5])
+            let portLow = UInt16(bytes[payloadStart + 6])
+            port = (portHigh << 8) | portLow
+            tokenStart = payloadStart + 7
+        }
+        let tokenBytes = bytes[tokenStart..<bytes.count]
+        guard let token = String(bytes: tokenBytes, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else { return nil }
+        let host = ipBytes.map(String.init).joined(separator: ".")
+        let url = "http://\(host):\(port)"
+        return """
+        {"ok":true,"service":"OpenCall Companion","version":\(version),"transport":"ble-advertisement","url":"\(url)","token":"\(token)","bluetoothUuid":"\(companionBluetoothServiceUUIDString)"}
+        """.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func useDiscoveredPeripheral(_ peripheral: CBPeripheral, central: CBCentralManager, advertisedMatch: Bool) {
+        self.peripheral = peripheral
+        probingUnadvertisedPeripheral = !advertisedMatch
+        if !advertisedMatch { probedAdvertisements += 1 }
+        peripheral.delegate = self
+        central.stopScan()
+        if peripheral.state == .connected {
+            peripheral.discoverServices([serviceUUID])
+        } else {
+            central.connect(peripheral, options: nil)
+        }
+    }
+
+    private func resumeScanningAfterProbeMiss() {
+        guard !finished, let central else { return }
+        if let peripheral { central.cancelPeripheralConnection(peripheral) }
+        peripheral = nil
+        probingUnadvertisedPeripheral = false
+        usingTargetedScan = false
+        central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+    }
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        switch central.state {
+        case .poweredOn:
+            if let connected = central.retrieveConnectedPeripherals(withServices: [serviceUUID]).first {
+                useDiscoveredPeripheral(connected, central: central, advertisedMatch: true)
+                return
+            }
+            usingTargetedScan = true
+            central.scanForPeripherals(withServices: [serviceUUID], options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+            queue.asyncAfter(deadline: .now() + 8.0) { [weak self, weak central] in
+                guard let self, let central else { return }
+                if !self.finished && self.peripheral == nil && self.usingTargetedScan {
+                    self.usingTargetedScan = false
+                    central.stopScan()
+                    central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+                }
+            }
+        case .unsupported:
+            finish(.failure(SyncError("BLE is unsupported on this Mac")))
+        case .unauthorized:
+            finish(.failure(SyncError("Bluetooth permission denied for BLE discovery")))
+        case .poweredOff:
+            finish(.failure(SyncError("Bluetooth is powered off")))
+        case .resetting, .unknown:
+            break
+        @unknown default:
+            break
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        discoveredAdvertisements += 1
+        let serviceUUIDs = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        let overflowUUIDs = (advertisementData[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID]) ?? []
+        let solicitedUUIDs = (advertisementData[CBAdvertisementDataSolicitedServiceUUIDsKey] as? [CBUUID]) ?? []
+        let serviceData = (advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data]) ?? [:]
+        if let json = metadataFromAdvertisement(advertisementData) {
+            finish(.success(json))
+            return
+        }
+        if advertisementSummaries.count < 8 {
+            let localName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+            let name = localName ?? peripheral.name ?? "(unnamed)"
+            let svc = (serviceUUIDs + overflowUUIDs + solicitedUUIDs + Array(serviceData.keys)).prefix(4).map { $0.uuidString }.joined(separator: ",")
+            advertisementSummaries.append("name=\(name), rssi=\(RSSI), services=\(svc.isEmpty ? "none" : svc)")
+        }
+        let advertisedMatch = usingTargetedScan
+                || serviceUUIDs.contains(serviceUUID)
+                || overflowUUIDs.contains(serviceUUID)
+                || solicitedUUIDs.contains(serviceUUID)
+                || serviceData.keys.contains(serviceUUID)
+        if advertisedMatch {
+            useDiscoveredPeripheral(peripheral, central: central, advertisedMatch: true)
+            return
+        }
+        // Some Android/Tahoe combinations keep the GATT service off the advertisement
+        // payload. Probe a bounded number of discovered peripherals and discover the
+        // OpenCall service over GATT before giving up.
+        guard self.peripheral == nil,
+              probedAdvertisements < 12,
+              !triedPeripheralIDs.contains(peripheral.identifier) else { return }
+        triedPeripheralIDs.insert(peripheral.identifier)
+        useDiscoveredPeripheral(peripheral, central: central, advertisedMatch: false)
+    }
+
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        if probingUnadvertisedPeripheral {
+            resumeScanningAfterProbeMiss()
+            return
+        }
+        finish(.failure(SyncError("BLE connect failed: \(error?.localizedDescription ?? "unknown")")))
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        if probingUnadvertisedPeripheral {
+            resumeScanningAfterProbeMiss()
+            return
+        }
+        if !finished, let error {
+            finish(.failure(SyncError("BLE disconnected before metadata read: \(error.localizedDescription)")))
+        }
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        peripheral.discoverServices([serviceUUID])
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        if let error { finish(.failure(SyncError("BLE service discovery failed: \(error.localizedDescription)"))); return }
+        guard let service = peripheral.services?.first(where: { $0.uuid == serviceUUID }) else {
+            if probingUnadvertisedPeripheral {
+                resumeScanningAfterProbeMiss()
+                return
+            }
+            finish(.failure(SyncError("BLE OpenCall Companion service not found")))
+            return
+        }
+        peripheral.discoverCharacteristics([characteristicUUID, endpointCharacteristicUUID, tokenCharacteristicUUID], for: service)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        if let error { finish(.failure(SyncError("BLE characteristic discovery failed: \(error.localizedDescription)"))); return }
+        metadataCharacteristic = service.characteristics?.first(where: { $0.uuid == characteristicUUID })
+        endpointCharacteristic = service.characteristics?.first(where: { $0.uuid == endpointCharacteristicUUID })
+        tokenCharacteristic = service.characteristics?.first(where: { $0.uuid == tokenCharacteristicUUID })
+        readNextBluetoothMetadataValue(peripheral)
+    }
+
+    private func readNextBluetoothMetadataValue(_ peripheral: CBPeripheral) {
+        if endpointText == nil, let endpointCharacteristic {
+            peripheral.readValue(for: endpointCharacteristic)
+            return
+        }
+        if tokenText == nil, let tokenCharacteristic {
+            peripheral.readValue(for: tokenCharacteristic)
+            return
+        }
+        if let endpointText, let tokenText, !endpointText.isEmpty, !tokenText.isEmpty {
+            let url = endpointText.hasPrefix("http://") || endpointText.hasPrefix("https://") ? endpointText : "http://\(endpointText)"
+            let json = """
+            {"ok":true,"service":"OpenCall Companion","version":8,"transport":"ble-gatt-short","url":"\(url)","token":"\(tokenText)","bluetoothUuid":"\(companionBluetoothServiceUUIDString)"}
+            """.trimmingCharacters(in: .whitespacesAndNewlines)
+            finish(.success(json))
+            return
+        }
+        if let metadataCharacteristic {
+            peripheral.readValue(for: metadataCharacteristic)
+            return
+        }
+        finish(.failure(SyncError("BLE OpenCall metadata characteristics not found")))
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        if let error { finish(.failure(SyncError("BLE metadata read failed: \(error.localizedDescription)"))); return }
+        guard let data = characteristic.value, !data.isEmpty else {
+            finish(.failure(SyncError("BLE metadata characteristic was empty")))
+            return
+        }
+        let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !text.isEmpty else {
+            finish(.failure(SyncError("BLE metadata was not UTF-8 text")))
+            return
+        }
+        if characteristic.uuid == endpointCharacteristicUUID {
+            endpointText = text
+            readNextBluetoothMetadataValue(peripheral)
+            return
+        }
+        if characteristic.uuid == tokenCharacteristicUUID {
+            tokenText = text
+            readNextBluetoothMetadataValue(peripheral)
+            return
+        }
+        finish(.success(text))
+    }
+}
+
+private final class CompanionSDPWaiter: NSObject {
+    private let runLoop: CFRunLoop
+    var done = false
+    var status: IOReturn = -1
+
+    init(runLoop: CFRunLoop = CFRunLoopGetCurrent()) {
+        self.runLoop = runLoop
+    }
+
+    @objc func sdpQueryComplete(_ device: IOBluetoothDevice, status: IOReturn) {
+        self.status = status
+        self.done = true
+        CFRunLoopStop(runLoop)
+    }
+
+    func wait(timeout: TimeInterval) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !done && Date() < deadline {
+            RunLoop.current.run(mode: .default, before: min(Date().addingTimeInterval(0.2), deadline))
+        }
+    }
+}
+
+private final class CompanionRFCOMMReader: NSObject, IOBluetoothRFCOMMChannelDelegate {
+    var data = Data()
+    var closed = false
+
+    @objc func rfcommChannelData(_ rfcommChannel: IOBluetoothRFCOMMChannel, data dataPointer: UnsafeMutableRawPointer, length dataLength: Int) {
+        data.append(dataPointer.assumingMemoryBound(to: UInt8.self), count: dataLength)
+    }
+
+    @objc func rfcommChannelClosed(_ rfcommChannel: IOBluetoothRFCOMMChannel) {
+        closed = true
+    }
+}
+
+private func companionUUIDBytes(_ uuid: String) throws -> [UInt8] {
+    let hex = uuid.replacingOccurrences(of: "-", with: "")
+    guard hex.count == 32 else { throw SyncError("Bad UUID: \(uuid)") }
+    var bytes: [UInt8] = []
+    var idx = hex.startIndex
+    while idx < hex.endIndex {
+        let next = hex.index(idx, offsetBy: 2)
+        guard let byte = UInt8(hex[idx..<next], radix: 16) else { throw SyncError("Bad UUID byte in \(uuid)") }
+        bytes.append(byte)
+        idx = next
+    }
+    return bytes
+}
+
+private func companionSDPUUID(_ uuid: String) throws -> IOBluetoothSDPUUID {
+    IOBluetoothSDPUUID(data: Data(try companionUUIDBytes(uuid)))
+}
+
+private func companionUUID16Value(_ uuid: IOBluetoothSDPUUID) -> UInt16? {
+    guard let compact = uuid.getWithLength(2) else { return nil }
+    let data = Data(referencing: compact)
+    guard data.count == 2 else { return nil }
+    return (UInt16(data[0]) << 8) | UInt16(data[1])
+}
+
+private func companionParseRFCOMMChannelID(from element: IOBluetoothSDPDataElement) -> BluetoothRFCOMMChannelID? {
+    guard let children = element.getArrayValue() as? [IOBluetoothSDPDataElement] else { return nil }
+    if children.count >= 2,
+       let uuid = children[0].getUUIDValue(),
+       companionUUID16Value(uuid) == 0x0003,
+       let number = children[1].getNumberValue() {
+        let channel = number.uint8Value
+        if channel > 0 { return BluetoothRFCOMMChannelID(channel) }
+    }
+    for child in children {
+        if let channel = companionParseRFCOMMChannelID(from: child) { return channel }
+    }
+    return nil
+}
+
+private func companionManuallyParsedRFCOMMChannelID(from service: IOBluetoothSDPServiceRecord) -> BluetoothRFCOMMChannelID? {
+    guard let protocolList = service.getAttributeDataElement(BluetoothSDPServiceAttributeID(0x0004)) else { return nil }
+    return companionParseRFCOMMChannelID(from: protocolList)
+}
+
+private func companionIsOpenCallMetadata(_ text: String) -> Bool {
+    text.contains("OpenCall Companion") && text.contains("token") && text.contains("url")
+}
+
+private func companionDevice(address rawAddress: String) throws -> IOBluetoothDevice {
+    let wanted = rawAddress.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !wanted.isEmpty else { throw SyncError("Missing Bluetooth address") }
+    let paired = (IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice]) ?? []
+    if let match = paired.first(where: { ($0.addressString ?? "").lowercased() == wanted }) { return match }
+    if let device = IOBluetoothDevice(addressString: wanted) { return device }
+    throw SyncError("Bluetooth device not found: \(rawAddress)")
+}
+
+private func companionReadRFCOMMMetadata(device: IOBluetoothDevice, channelID: BluetoothRFCOMMChannelID, timeout: TimeInterval, requireOpenCall: Bool) throws -> String {
+    let reader = CompanionRFCOMMReader()
+    var channel: IOBluetoothRFCOMMChannel?
+    let openStatus = device.openRFCOMMChannelSync(&channel, withChannelID: channelID, delegate: reader)
+    guard openStatus == kIOReturnSuccess, let channel else {
+        throw SyncError(String(format: "RFCOMM open failed on channel %u: 0x%08x", channelID, openStatus))
+    }
+    defer { _ = channel.close() }
+
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline && !reader.closed && !reader.data.contains(0x0a) {
+        RunLoop.current.run(mode: .default, before: min(Date().addingTimeInterval(0.05), deadline))
+    }
+    guard !reader.data.isEmpty else { throw SyncError("No metadata received on RFCOMM channel \(channelID)") }
+    let text = String(data: reader.data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !text.isEmpty else { throw SyncError("Metadata was empty on RFCOMM channel \(channelID)") }
+    if requireOpenCall && !companionIsOpenCallMetadata(text) {
+        throw SyncError("RFCOMM channel \(channelID) did not return OpenCall metadata")
+    }
+    return text
+}
+
+private func companionScanRFCOMMChannels(device: IOBluetoothDevice, until deadline: Date) throws -> String {
+    var failures: [String] = []
+    for raw in 1...30 {
+        if Date() >= deadline { break }
+        let channelID = BluetoothRFCOMMChannelID(raw)
+        let remaining = max(0.15, deadline.timeIntervalSinceNow)
+        let perChannel = min(0.75, remaining)
+        do {
+            return try companionReadRFCOMMMetadata(device: device, channelID: channelID, timeout: perChannel, requireOpenCall: true)
+        } catch {
+            if failures.count < 5 { failures.append("ch\(raw): \(error.localizedDescription)") }
+        }
+    }
+    throw SyncError("OpenCall RFCOMM channel scan failed (\(failures.joined(separator: "; ")))")
+}
+
+private func companionClassicMetadata(address: String, timeout: TimeInterval) throws -> String {
+    let device = try companionDevice(address: address)
+    let sdpUUID = try companionSDPUUID(companionBluetoothServiceUUIDString)
+    let deadline = Date().addingTimeInterval(timeout)
+    var errors: [String] = []
+    var channelID: BluetoothRFCOMMChannelID?
+
+    let waiter = CompanionSDPWaiter()
+    let started = device.performSDPQuery(waiter)
+    if started == kIOReturnSuccess {
+        waiter.wait(timeout: min(8, max(3, timeout * 0.35)))
+        if waiter.done, waiter.status == kIOReturnSuccess {
+            if let service = device.getServiceRecord(for: sdpUUID) {
+                var sdpChannel = BluetoothRFCOMMChannelID(0)
+                let channelStatus = service.getRFCOMMChannelID(&sdpChannel)
+                if channelStatus == kIOReturnSuccess, sdpChannel > 0 {
+                    channelID = sdpChannel
+                } else if let parsed = companionManuallyParsedRFCOMMChannelID(from: service), parsed > 0 {
+                    channelID = parsed
+                } else {
+                    errors.append(String(format: "SDP service had no RFCOMM channel: 0x%08x", channelStatus))
+                }
+            } else {
+                errors.append("OpenCall Companion service not found in SDP results")
+            }
+        } else if waiter.done {
+            errors.append(String(format: "Bluetooth SDP query failed: 0x%08x", waiter.status))
+        } else {
+            errors.append("Timed out waiting for Bluetooth SDP query")
+        }
+    } else {
+        errors.append(String(format: "SDP query failed to start: 0x%08x", started))
+    }
+
+    if let channelID {
+        do {
+            return try companionReadRFCOMMMetadata(device: device, channelID: channelID, timeout: max(1, deadline.timeIntervalSinceNow), requireOpenCall: false)
+        } catch {
+            errors.append("RFCOMM channel \(channelID) from SDP failed: \(error.localizedDescription)")
+        }
+    }
+
+    do {
+        return try companionScanRFCOMMChannels(device: device, until: deadline)
+    } catch {
+        errors.append("RFCOMM scan failed: \(error.localizedDescription)")
+        throw SyncError(errors.joined(separator: "; "))
+    }
+}
+
+
+struct HealthResponse: Decodable {    let ok: Bool
     let service: String?
     let running: Bool?
     let port: Int?
@@ -254,6 +706,7 @@ final class AppModel: NSObject, ObservableObject {
     private var lastMessagePoll = Date.distantPast
     private var notificationPanels: [NSPanel] = []
     private var messagePanels: [NSPanel] = []
+    private var bleDiscoverer: CompanionBLEDiscoverer?
     private var companionCallStateFailureCount = 0
     private var lastHfpFallbackPoll = Date.distantPast
 
@@ -1095,44 +1548,84 @@ final class AppModel: NSObject, ObservableObject {
     }
 
     func discoverCompanionByBluetooth() {
-        guard !selectedAddress.isEmpty else {
-            syncStatus = "Select the paired Android phone first."
-            return
-        }
-        let helper = btHelperPath
-        let address = selectedAddress
         busy = true
-        syncStatus = "Discovering companion over Bluetooth…"
-        DispatchQueue.global(qos: .userInitiated).async {
-            let result = Self.runBluetoothHelper(path: helper, address: address)
-            DispatchQueue.main.async {
+        syncStatus = "Discovering companion over Bluetooth LE…"
+        appendAppLog("Bluetooth companion discovery started with in-app BLE scan")
+        let discoverer = CompanionBLEDiscoverer(timeout: 20) { [weak self] result in
+            guard let self else { return }
+            self.bleDiscoverer = nil
+            switch result {
+            case .success(let text):
                 self.busy = false
-                guard result.exitCode == 0 else {
-                    let message = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-                    self.syncStatus = "Bluetooth discovery failed: \(message.isEmpty ? "helper exit \(result.exitCode)" : message)"
+                self.applyCompanionMetadata(text, source: "Bluetooth LE")
+            case .failure(let error):
+                self.appendAppLog("BLE companion discovery failed: \(error.localizedDescription)")
+                guard !self.selectedAddress.isEmpty else {
+                    self.busy = false
+                    self.syncStatus = "Bluetooth LE discovery failed: \(error.localizedDescription). Select a paired phone for classic Bluetooth fallback."
                     return
                 }
-                guard let jsonLine = result.stdout.split(separator: "\n").first(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{") }) else {
-                    self.syncStatus = "Bluetooth discovery failed: no metadata returned."
-                    return
+                self.syncStatus = "BLE failed; trying classic Bluetooth fallback…"
+                self.discoverCompanionByClassicBluetooth(bleError: error.localizedDescription)
+            }
+        }
+        bleDiscoverer = discoverer
+        discoverer.start()
+    }
+
+    private func discoverCompanionByClassicBluetooth(bleError: String) {
+        let address = selectedAddress
+        let helper = btHelperPath
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let text = try companionClassicMetadata(address: address, timeout: 24)
+                DispatchQueue.main.async {
+                    self.busy = false
+                    self.applyCompanionMetadata(text, source: "classic Bluetooth")
                 }
-                do {
-                    let metadata = try JSONDecoder().decode(CompanionMetadata.self, from: Data(String(jsonLine).utf8))
-                    guard metadata.ok != false,
-                          let url = metadata.url?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty,
-                          let token = metadata.token?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else {
-                        self.syncStatus = "Bluetooth discovery returned incomplete metadata."
+            } catch {
+                let inAppClassic = error.localizedDescription
+                // Last-resort legacy helper fallback for older macOS behavior. Tahoe usually
+                // needs the in-app path above because btmeta is a separate Bluetooth client.
+                let result = Self.runBluetoothHelper(path: helper, address: address, mode: "classic", timeout: 18)
+                DispatchQueue.main.async {
+                    self.busy = false
+                    guard result.exitCode == 0 else {
+                        let message = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let helperClassic = message.isEmpty ? "helper exit \(result.exitCode)" : message
+                        self.syncStatus = "Bluetooth discovery failed. BLE: \(bleError); Classic: \(inAppClassic); Helper: \(helperClassic)"
+                        self.appendAppLog("Classic Bluetooth companion discovery failed after BLE failure. inApp=\(inAppClassic); helper=\(helperClassic)")
                         return
                     }
-                    self.companionURL = url
-                    self.companionToken = token
-                    self.saveCompanionSettings()
-                    self.syncStatus = "Discovered OpenCall Companion over Bluetooth. URL/token filled."
-                    self.syncHealth()
-                } catch {
-                    self.syncStatus = "Bluetooth discovery decode failed: \(error.localizedDescription)"
+                    guard let jsonLine = result.stdout.split(separator: "\n").first(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{") }) else {
+                        self.syncStatus = "Classic Bluetooth helper returned no metadata after in-app classic failed: \(inAppClassic)"
+                        return
+                    }
+                    self.applyCompanionMetadata(String(jsonLine), source: "classic Bluetooth helper")
                 }
             }
+        }
+    }
+
+    private func applyCompanionMetadata(_ jsonLine: String, source: String) {
+        do {
+            let metadata = try JSONDecoder().decode(CompanionMetadata.self, from: Data(jsonLine.utf8))
+            guard metadata.ok != false,
+                  let url = metadata.url?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty,
+                  let token = metadata.token?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else {
+                syncStatus = "Bluetooth discovery returned incomplete metadata."
+                appendAppLog("Bluetooth discovery returned incomplete metadata via \(source)")
+                return
+            }
+            companionURL = url
+            companionToken = token
+            saveCompanionSettings()
+            syncStatus = "Discovered OpenCall Companion over \(source). URL/token filled."
+            appendAppLog("Discovered OpenCall Companion over \(source); url=\(url)")
+            syncHealth()
+        } catch {
+            syncStatus = "Bluetooth discovery decode failed: \(error.localizedDescription)"
+            appendAppLog("Bluetooth discovery decode failed via \(source): \(error.localizedDescription)")
         }
     }
 
@@ -1384,12 +1877,12 @@ final class AppModel: NSObject, ObservableObject {
         }.resume()
     }
 
-    nonisolated static func runBluetoothHelper(path: String, address: String) -> ProcessOutput {
+    nonisolated static func runBluetoothHelper(path: String, address: String, mode: String = "auto", timeout: Int = 10) -> ProcessOutput {
         let task = Process()
         let stdout = Pipe()
         let stderr = Pipe()
         task.executableURL = URL(fileURLWithPath: path)
-        task.arguments = ["--address", address, "--timeout", "10"]
+        task.arguments = ["--mode", mode, "--address", address, "--timeout", String(timeout)]
         task.standardOutput = stdout
         task.standardError = stderr
         do {
@@ -1629,6 +2122,7 @@ struct SmsMessageDetailView: View {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSUserNotificationCenterDelegate {
+    private var diagnosticModel: AppModel?
     static func configureNotificationCategories() {
         let answer = UNNotificationAction(identifier: OpenCallNotificationAction.answer,
                                           title: "Answer",
@@ -1652,6 +2146,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         Self.configureNotificationCategories()
         UNUserNotificationCenter.current().delegate = self
         NSUserNotificationCenter.default.delegate = self
+        if CommandLine.arguments.contains("--test-bluetooth-discovery") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                let model = AppModel.shared ?? AppModel()
+                if AppModel.shared == nil { self.diagnosticModel = model }
+                model.discoverCompanionByBluetooth()
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -1854,7 +2355,7 @@ struct ContentView: View {
                 }
                 HStack(spacing: 10) {
                     Button("Auto via Bluetooth") { model.discoverCompanionByBluetooth() }
-                        .disabled(model.busy || model.selectedAddress.isEmpty)
+                        .disabled(model.busy)
                     Button("Health") { model.syncHealth() }
                     Button("Contacts") { model.syncContacts() }
                     Button("Recents") { model.syncCalls() }

@@ -23,7 +23,7 @@ codesign --force --sign - "$APP/Contents/MacOS/btmeta" >/dev/null
 
 swiftc -parse-as-library Sources/OpenCallMac/main.swift \
   -o "$APP/Contents/MacOS/OpenCallMac" \
-  -framework SwiftUI -framework AppKit -framework IOBluetooth -framework UserNotifications
+  -framework SwiftUI -framework AppKit -framework IOBluetooth -framework CoreBluetooth -framework UserNotifications
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
