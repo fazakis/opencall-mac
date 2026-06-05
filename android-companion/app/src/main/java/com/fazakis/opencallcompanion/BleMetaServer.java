@@ -196,7 +196,7 @@ final class BleMetaServer {
             JSONObject obj = new JSONObject();
             obj.put("ok", true);
             obj.put("service", "OpenCall Companion");
-            obj.put("version", 5);
+            obj.put("version", 6);
             obj.put("transport", "ble-gatt");
             obj.put("url", httpServer.localUrl());
             obj.put("port", LocalHttpServer.PORT);

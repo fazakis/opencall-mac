@@ -92,6 +92,13 @@ struct SendSmsResponse: Decodable {
     let error: String?
 }
 
+struct DialResponse: Decodable {
+    let ok: Bool
+    let dialed: Bool?
+    let numberLength: Int?
+    let error: String?
+}
+
 struct PhoneContact: Codable, Identifiable, Hashable {
     let id: String
     let name: String
@@ -192,6 +199,8 @@ final class AppModel: NSObject, ObservableObject {
     private static let messagesCacheKey = "cachedSmsMessages"
     private static let activeCallPollPausedUntilKey = "activeCallPollPausedUntil"
     private static let activeCallPollPauseSeconds: TimeInterval = 90 * 60
+    private static let companionFailuresBeforeHfpFallback = 3
+    private static let hfpFallbackPollCooldown: TimeInterval = 60
 
     @Published var devices: [PhoneDevice] = []
     @Published var selectedAddress = UserDefaults.standard.string(forKey: "selectedAddress") ?? "" {
@@ -201,10 +210,19 @@ final class AppModel: NSObject, ObservableObject {
             }
         }
     }
-    @Published var output = "Ready. Buttons run the bundled hfpctl helper using native macOS HFP APIs."
+    @Published var output = "Ready. OpenCall uses the Android companion for phone state/dialing, with native macOS HFP as fallback."
     @Published var busy = false
     @Published var logText = ""
-    @Published var dialNumber = ""
+    @Published var dialNumber = UserDefaults.standard.string(forKey: "dialNumber") ?? "" {
+        didSet {
+            let trimmed = dialNumber.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                UserDefaults.standard.removeObject(forKey: "dialNumber")
+            } else {
+                UserDefaults.standard.set(trimmed, forKey: "dialNumber")
+            }
+        }
+    }
 
     @Published var companionURL = UserDefaults.standard.string(forKey: "companionURL") ?? "http://PHONE-IP:9096"
     @Published var companionToken = UserDefaults.standard.string(forKey: "companionToken") ?? ""
@@ -236,6 +254,8 @@ final class AppModel: NSObject, ObservableObject {
     private var lastMessagePoll = Date.distantPast
     private var notificationPanels: [NSPanel] = []
     private var messagePanels: [NSPanel] = []
+    private var companionCallStateFailureCount = 0
+    private var lastHfpFallbackPoll = Date.distantPast
 
     let logPath = NSString(string: "~/opencall-mac/logs/hfp.log").expandingTildeInPath
 
@@ -304,13 +324,37 @@ final class AppModel: NSObject, ObservableObject {
     }
 
     func run(_ command: String, number: String? = nil) {
-        guard !selectedAddress.isEmpty else {
-            output = "No phone selected."
-            return
-        }
         let dialNumber = number?.trimmingCharacters(in: .whitespacesAndNewlines)
         if command == "dial", (dialNumber ?? "").isEmpty {
             output = "Enter a phone number before pressing Dial."
+            return
+        }
+        if command == "dial", let dialNumber, companionCallStateAvailable {
+            pauseAutomaticCallPollingForActiveCall(note: "after dialing through companion")
+            busy = true
+            output = "Dialing through Android companion…"
+            sendCompanionDial(number: dialNumber) { result in
+                switch result {
+                case .success(let message):
+                    self.busy = false
+                    self.output = message
+                    self.appendAppLog("Dial requested through Android companion; numberLength=\(dialNumber.count)")
+                    self.pollCompanionCallStateForMonitor()
+                case .failure(let error):
+                    self.appendAppLog("Companion dial failed; falling back to native HFP: \(error.message)")
+                    self.output = "Companion dial failed; trying native HFP…"
+                    guard !self.selectedAddress.isEmpty else {
+                        self.busy = false
+                        self.output = "Companion dial failed and no Bluetooth phone is selected for HFP fallback."
+                        return
+                    }
+                    self.runHfpHelper(command: command, helper: self.helperPath, address: self.selectedAddress, logPath: self.logPath, dialNumber: dialNumber)
+                }
+            }
+            return
+        }
+        guard !selectedAddress.isEmpty else {
+            output = command == "dial" ? "No companion configured and no Bluetooth phone selected for HFP fallback." : "No Bluetooth phone selected for native HFP control."
             return
         }
         if command == "answer" || command == "dial" {
@@ -322,7 +366,16 @@ final class AppModel: NSObject, ObservableObject {
         let address = selectedAddress
         let logPath = logPath
         busy = true
-        output = "Running native HFP \(command)…"
+        output = "Running native HFP fallback \(command)…"
+        runHfpHelper(command: command, helper: helper, address: address, logPath: logPath, dialNumber: dialNumber)
+    }
+
+    func call(_ number: String) {
+        dialNumber = number
+        run("dial", number: number)
+    }
+
+    private func runHfpHelper(command: String, helper: String, address: String, logPath: String, dialNumber: String?) {
         DispatchQueue.global(qos: .userInitiated).async {
             let result = Self.runHelper(path: helper, command: command, address: address, logPath: logPath, number: dialNumber)
             DispatchQueue.main.async {
@@ -332,11 +385,6 @@ final class AppModel: NSObject, ObservableObject {
                 self.refreshLog()
             }
         }
-    }
-
-    func call(_ number: String) {
-        dialNumber = number
-        run("dial", number: number)
     }
 
     func refreshLog() {
@@ -410,20 +458,20 @@ final class AppModel: NSObject, ObservableObject {
     }
 
     func autoConnectSelectedPhone() {
-        guard !selectedAddress.isEmpty else {
-            monitorStatus = "No remembered phone available."
-            return
-        }
         if companionCallStateAvailable {
-            monitorStatus = "Using Android companion for call state; automatic HFP probe skipped."
+            monitorStatus = "Using Android companion for call state; HFP fallback not needed."
             pollCompanionCallStateForMonitor()
             return
         }
-        guard !isAutomaticCallPollingPaused else {
-            monitorStatus = "Call audio protected: automatic HFP polling is paused."
+        guard !selectedAddress.isEmpty else {
+            monitorStatus = "No companion configured and no Bluetooth phone selected for HFP fallback."
             return
         }
-        pollCallState(reason: "Auto-connecting to \(selectedDeviceName)…")
+        guard !isAutomaticCallPollingPaused else {
+            monitorStatus = "Call audio protected: automatic HFP fallback polling is paused."
+            return
+        }
+        pollCallState(reason: "Checking native HFP fallback for \(selectedDeviceName)…")
     }
 
     private var isAutomaticCallPollingPaused: Bool {
@@ -444,8 +492,8 @@ final class AppModel: NSObject, ObservableObject {
         if !wasPaused {
             activeCallPollMinimumResumeAt = Date().addingTimeInterval(45)
         }
-        monitorStatus = "Call audio protected: automatic HFP polling off; companion watches call state."
-        appendAppLog("Automatic HFP polling paused \(note) until \(Self.shortTime(activeCallPollPausedUntil)) to avoid stealing Bluetooth/AirPods audio")
+        monitorStatus = "Call audio protected: automatic HFP fallback polling off; companion watches call state."
+        appendAppLog("Automatic HFP fallback polling paused \(note) until \(Self.shortTime(activeCallPollPausedUntil)) to avoid stealing Bluetooth/AirPods audio")
     }
 
     func resumeAutomaticCallPollingNow() {
@@ -459,7 +507,7 @@ final class AppModel: NSObject, ObservableObject {
         activeCallNotified = false
         incomingCallNotified = false
         monitorStatus = "Call monitor resumed."
-        appendAppLog("Automatic HFP polling resumed after \(logReason)")
+        appendAppLog("Automatic HFP fallback polling resumed after \(logReason)")
     }
 
     nonisolated private static func shortTime(_ date: Date) -> String {
@@ -472,14 +520,16 @@ final class AppModel: NSObject, ObservableObject {
     private func pollResidentStatus() {
         guard monitoringEnabled else { return }
         refreshDevices()
-        if !selectedAddress.isEmpty {
-            if companionCallStateAvailable {
-                pollCompanionCallStateForMonitor()
-            } else if isAutomaticCallPollingPaused {
-                monitorStatus = "Call audio protected: automatic HFP polling is paused."
+        if companionCallStateAvailable {
+            pollCompanionCallStateForMonitor()
+        } else if !selectedAddress.isEmpty {
+            if isAutomaticCallPollingPaused {
+                monitorStatus = "Call audio protected: automatic HFP fallback polling is paused."
             } else {
                 pollCallState(reason: nil)
             }
+        } else {
+            monitorStatus = "No companion configured; select a Bluetooth phone for HFP fallback."
         }
         if Date().timeIntervalSince(lastMessagePoll) >= 18 {
             lastMessagePoll = Date()
@@ -510,6 +560,7 @@ final class AppModel: NSObject, ObservableObject {
     }
 
     private func handleCompanionCallState(_ response: CallStateResponse) {
+        companionCallStateFailureCount = 0
         let state = (response.state ?? "unknown").lowercased()
         let now = Date()
         if response.offhook == true || state == "offhook" || state == "active" {
@@ -541,12 +592,12 @@ final class AppModel: NSObject, ObservableObject {
             if isAutomaticCallPollingPaused {
                 if Date() >= activeCallPollMinimumResumeAt {
                     resumeAutomaticCallPollingAfterCallEnded(logReason: "companion call-state idle")
-                    monitorStatus = "Phone idle by companion; HFP auto-polling resumed."
+                    monitorStatus = "Phone idle by companion; fallback HFP monitor available."
                 } else {
-                    monitorStatus = "Phone idle; waiting briefly before HFP auto-poll resumes."
+                    monitorStatus = "Phone idle; keeping fallback HFP monitor paused briefly."
                 }
             } else {
-                monitorStatus = "Phone idle by companion; HFP auto-polling skipped."
+                monitorStatus = "Phone idle by companion; HFP fallback not needed."
             }
             return
         }
@@ -554,11 +605,26 @@ final class AppModel: NSObject, ObservableObject {
     }
 
     private func handleCompanionCallStateFailure(_ message: String) {
+        companionCallStateFailureCount += 1
         if isAutomaticCallPollingPaused {
             monitorStatus = "Call audio protected; companion call-state unavailable: \(message)"
             return
         }
-        appendAppLog("Companion call-state unavailable; falling back to HFP monitor: \(message)")
+        guard !selectedAddress.isEmpty else {
+            monitorStatus = "Companion call-state unavailable; no Bluetooth phone selected for HFP fallback."
+            return
+        }
+        let failuresReady = companionCallStateFailureCount >= Self.companionFailuresBeforeHfpFallback
+        let cooldownReady = Date().timeIntervalSince(lastHfpFallbackPoll) >= Self.hfpFallbackPollCooldown
+        guard failuresReady && cooldownReady else {
+            monitorStatus = "Companion call-state unavailable; waiting before HFP fallback."
+            if companionCallStateFailureCount == 1 {
+                appendAppLog("Companion call-state unavailable; not using HFP fallback yet: \(message)")
+            }
+            return
+        }
+        lastHfpFallbackPoll = Date()
+        appendAppLog("Companion call-state unavailable after \(companionCallStateFailureCount) failures; using throttled HFP fallback: \(message)")
         pollCallState(reason: nil)
     }
 
@@ -1143,6 +1209,64 @@ final class AppModel: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { self.syncMessages() }
     }
 
+    func sendCompanionDial(number: String, completion: @escaping (Result<String, SyncError>) -> Void) {
+        let cleanNumber = number.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanNumber.isEmpty else {
+            completion(.failure(SyncError("No dial number.")))
+            return
+        }
+        let base = companionURL.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !base.isEmpty, base.contains("://") else {
+            completion(.failure(SyncError("Enter companion URL first.")))
+            return
+        }
+        let token = companionToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            completion(.failure(SyncError("Enter companion token first.")))
+            return
+        }
+        var components = URLComponents(string: base + "/dial")
+        components?.queryItems = [URLQueryItem(name: "token", value: token)]
+        guard let url = components?.url else {
+            completion(.failure(SyncError("Bad companion URL.")))
+            return
+        }
+        var request = URLRequest(url: url, timeoutInterval: 10)
+        request.httpMethod = "POST"
+        request.setValue(token, forHTTPHeaderField: "X-OpenCall-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: ["number": cleanNumber], options: [])
+        } catch {
+            completion(.failure(SyncError(error.localizedDescription)))
+            return
+        }
+        URLSession.shared.dataTask(with: request) { data, _, error in
+            if let error {
+                DispatchQueue.main.async { completion(.failure(SyncError(error.localizedDescription))) }
+                return
+            }
+            guard let data else {
+                DispatchQueue.main.async { completion(.failure(SyncError("no response"))) }
+                return
+            }
+            do {
+                let decoded = try JSONDecoder().decode(DialResponse.self, from: data)
+                DispatchQueue.main.async {
+                    if decoded.ok && decoded.dialed == true {
+                        completion(.success("Dial requested through Android companion."))
+                    } else {
+                        completion(.failure(SyncError(decoded.error ?? "unknown dial error")))
+                    }
+                }
+            } catch {
+                let raw = String(data: data, encoding: .utf8) ?? ""
+                DispatchQueue.main.async { completion(.failure(SyncError(raw.isEmpty ? error.localizedDescription : raw))) }
+            }
+        }.resume()
+    }
+
     func sendSmsReply(to number: String, text: String, completion: @escaping (String) -> Void) {
         let cleanNumber = number.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1601,8 +1725,8 @@ struct MenuBarView: View {
         Text(model.selectedDeviceName.isEmpty ? "No phone selected" : model.selectedDeviceName)
         Text(model.monitorStatus)
         Divider()
-        Button("Check HFP") { model.autoConnectSelectedPhone() }
-        Button("Resume HFP Monitor") { model.resumeAutomaticCallPollingNow() }
+        Button("Check phone state") { model.autoConnectSelectedPhone() }
+        Button("Resume fallback monitor") { model.resumeAutomaticCallPollingNow() }
         Button("Sync All") { model.syncAll() }
         Button("Auto via Bluetooth") { model.discoverCompanionByBluetooth() }
         Button("Test Notification") { model.sendTestNotification() }
@@ -1637,7 +1761,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("OpenCall Mac")
                     .font(.title2.weight(.semibold))
-                Text("Native HFP call control + Android companion sync")
+                Text("Android companion-first phone control + native HFP fallback")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1674,7 +1798,7 @@ struct ContentView: View {
     private var callControls: some View {
         HStack(spacing: 12) {
             Button { model.run("status") } label: {
-                Label("Check HFP", systemImage: "antenna.radiowaves.left.and.right").frame(maxWidth: .infinity)
+                Label("Check HFP fallback", systemImage: "antenna.radiowaves.left.and.right").frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
             .controlSize(.large)
@@ -1698,13 +1822,13 @@ struct ContentView: View {
     }
 
     private var residentControls: some View {
-        GroupBox("Resident Menu Bar Monitor") {
+        GroupBox("Resident Companion Monitor") {
             HStack(spacing: 14) {
                 Toggle("Launch at login", isOn: Binding(get: { model.launchAtLoginEnabled }, set: { model.setLaunchAtLogin($0) }))
                 Toggle("Monitor calls/messages", isOn: Binding(get: { model.monitoringEnabled }, set: { model.setMonitoringEnabled($0) }))
-                Button("Auto-connect now") { model.autoConnectSelectedPhone() }
-                    .disabled(model.selectedAddress.isEmpty)
-                Button("Resume HFP monitor") { model.resumeAutomaticCallPollingNow() }
+                Button("Check phone now") { model.autoConnectSelectedPhone() }
+                    .disabled(model.busy)
+                Button("Resume fallback monitor") { model.resumeAutomaticCallPollingNow() }
                 Button("Test notification") { model.sendTestNotification() }
                 Spacer()
                 Text(model.monitorStatus)

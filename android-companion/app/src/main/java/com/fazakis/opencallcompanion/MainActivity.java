@@ -122,6 +122,7 @@ public class MainActivity extends Activity {
         addIfMissing(needed, Manifest.permission.READ_CONTACTS);
         addIfMissing(needed, Manifest.permission.READ_SMS);
         addIfMissing(needed, Manifest.permission.SEND_SMS);
+        addIfMissing(needed, Manifest.permission.CALL_PHONE);
         addIfMissing(needed, Manifest.permission.READ_CALL_LOG);
         addIfMissing(needed, Manifest.permission.READ_PHONE_STATE);
         if (Build.VERSION.SDK_INT >= 31) {
@@ -147,6 +148,7 @@ public class MainActivity extends Activity {
         appendPerm(sb, "Contacts", Manifest.permission.READ_CONTACTS);
         appendPerm(sb, "SMS read", Manifest.permission.READ_SMS);
         appendPerm(sb, "SMS send", Manifest.permission.SEND_SMS);
+        appendPerm(sb, "Phone dial", Manifest.permission.CALL_PHONE);
         appendPerm(sb, "Call log", Manifest.permission.READ_CALL_LOG);
         appendPerm(sb, "Phone state", Manifest.permission.READ_PHONE_STATE);
         if (Build.VERSION.SDK_INT >= 31) {
@@ -162,7 +164,7 @@ public class MainActivity extends Activity {
         if (bleError != null) sb.append(" (").append(bleError).append(")");
         sb.append("\nUUID: ").append(BluetoothMetaServer.SERVICE_UUID).append("\n");
         sb.append("BLE characteristic: ").append(BleMetaServer.CHARACTERISTIC_UUID).append("\n");
-        sb.append("\nEndpoints:\n/health\n/contacts?token=TOKEN\n/calls?token=TOKEN\n/sms?token=TOKEN\nPOST /send-sms?token=TOKEN {\"number\":\"...\",\"text\":\"...\"}\n");
+        sb.append("\nEndpoints:\n/health\n/call-state?token=TOKEN\n/contacts?token=TOKEN\n/calls?token=TOKEN\n/sms?token=TOKEN\nPOST /dial?token=TOKEN {\"number\":\"...\"}\nPOST /send-sms?token=TOKEN {\"number\":\"...\",\"text\":\"...\"}\n");
         status.setText(sb.toString());
     }
 

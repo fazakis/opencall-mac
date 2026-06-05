@@ -75,7 +75,7 @@ final class BluetoothMetaServer {
             JSONObject obj = new JSONObject();
             obj.put("ok", true);
             obj.put("service", "OpenCall Companion");
-            obj.put("version", 5);
+            obj.put("version", 6);
             obj.put("transport", "classic-rfcomm-insecure");
             obj.put("url", httpServer.localUrl());
             obj.put("port", LocalHttpServer.PORT);

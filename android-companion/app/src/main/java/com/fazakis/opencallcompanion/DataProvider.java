@@ -2,12 +2,15 @@ package com.fazakis.opencallcompanion;
 
 import android.Manifest;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Bundle;
 import android.provider.CallLog;
 import android.provider.ContactsContract;
 import android.provider.Telephony;
+import android.telecom.TelecomManager;
 import android.telephony.SmsManager;
 
 import org.json.JSONArray;
@@ -145,6 +148,25 @@ final class DataProvider {
         return out;
     }
 
+    JSONObject dial(String number) throws Exception {
+        require(Manifest.permission.CALL_PHONE);
+        String clean = number == null ? "" : number.trim();
+        if (clean.isEmpty()) throw new IllegalArgumentException("Missing number");
+        Uri uri = Uri.fromParts("tel", clean, null);
+        TelecomManager telecom = context.getSystemService(TelecomManager.class);
+        if (telecom != null) {
+            telecom.placeCall(uri, new Bundle());
+        } else {
+            Intent intent = new Intent(Intent.ACTION_CALL, uri);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            context.startActivity(intent);
+        }
+        JSONObject out = ok();
+        out.put("dialed", true);
+        out.put("numberLength", clean.length());
+        return out;
+    }
+
     JSONObject sendSms(String number, String text) throws Exception {
         require(Manifest.permission.SEND_SMS);
         String cleanNumber = number == null ? "" : number.trim();
@@ -174,7 +196,7 @@ final class DataProvider {
     JSONObject health(String token, boolean running, int port, boolean bluetoothRunning, boolean bleRunning, String bleError) throws Exception {
         JSONObject out = ok();
         out.put("service", "OpenCall Companion");
-        out.put("version", 5);
+        out.put("version", 6);
         out.put("running", running);
         out.put("port", port);
         out.put("bluetoothRunning", bluetoothRunning || bleRunning);
@@ -190,6 +212,7 @@ final class DataProvider {
         if (!hasPermission(Manifest.permission.READ_CONTACTS)) missing.put("READ_CONTACTS");
         if (!hasPermission(Manifest.permission.READ_SMS)) missing.put("READ_SMS");
         if (!hasPermission(Manifest.permission.SEND_SMS)) missing.put("SEND_SMS");
+        if (!hasPermission(Manifest.permission.CALL_PHONE)) missing.put("CALL_PHONE");
         if (!hasPermission(Manifest.permission.READ_CALL_LOG)) missing.put("READ_CALL_LOG");
         if (!hasPermission(Manifest.permission.READ_PHONE_STATE)) missing.put("READ_PHONE_STATE");
         if (android.os.Build.VERSION.SDK_INT >= 31 && !hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) missing.put("BLUETOOTH_CONNECT");
