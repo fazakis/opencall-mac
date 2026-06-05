@@ -174,12 +174,14 @@ final class DataProvider {
     JSONObject health(String token, boolean running, int port, boolean bluetoothRunning, boolean bleRunning, String bleError) throws Exception {
         JSONObject out = ok();
         out.put("service", "OpenCall Companion");
-        out.put("version", 4);
+        out.put("version", 5);
         out.put("running", running);
         out.put("port", port);
         out.put("bluetoothRunning", bluetoothRunning || bleRunning);
         out.put("classicBluetoothRunning", bluetoothRunning);
         out.put("bleRunning", bleRunning);
+        out.put("bleMode", OpenCallCompanionService.bleMetaServer(context).advertiseModeName());
+        out.put("bleLastMacSeenAt", OpenCallCompanionService.bleMetaServer(context).lastMacSeenAt());
         out.put("bleError", bleError == null ? JSONObject.NULL : bleError);
         out.put("bluetoothUuid", BluetoothMetaServer.SERVICE_UUID.toString());
         out.put("bleCharacteristicUuid", BleMetaServer.CHARACTERISTIC_UUID.toString());

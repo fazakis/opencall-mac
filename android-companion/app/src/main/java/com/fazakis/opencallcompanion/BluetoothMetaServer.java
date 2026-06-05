@@ -75,7 +75,7 @@ final class BluetoothMetaServer {
             JSONObject obj = new JSONObject();
             obj.put("ok", true);
             obj.put("service", "OpenCall Companion");
-            obj.put("version", 3);
+            obj.put("version", 5);
             obj.put("transport", "classic-rfcomm-insecure");
             obj.put("url", httpServer.localUrl());
             obj.put("port", LocalHttpServer.PORT);
@@ -83,6 +83,7 @@ final class BluetoothMetaServer {
             obj.put("bluetoothUuid", SERVICE_UUID.toString());
             out.write((obj.toString() + "\n").getBytes(StandardCharsets.UTF_8));
             out.flush();
+            OpenCallCompanionService.noteMacSeen(context);
         } catch (Exception ignored) {
         }
     }

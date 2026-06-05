@@ -41,6 +41,10 @@ public class OpenCallCompanionService extends Service {
         return callStateTracker;
     }
 
+    static void noteMacSeen(android.content.Context context) {
+        bleMetaServer(context).noteMacSeen();
+    }
+
     @Override public void onCreate() {
         super.onCreate();
         startForeground(42, notification());

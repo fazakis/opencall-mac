@@ -109,6 +109,7 @@ final class LocalHttpServer {
                 respond(out, 401, error("bad_or_missing_token"));
                 return;
             }
+            OpenCallCompanionService.noteMacSeen(context);
 
             int limit = parseLimit(params.get("limit"));
             try {
